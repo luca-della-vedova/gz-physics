@@ -169,6 +169,7 @@ struct ModelInfo
   int indexInWorld;
   Eigen::Isometry3d rootLinkToModelTf;
   Eigen::Isometry3d baseInertiaToLinkFrame;
+  gz::math::Pose3d baseInertiaToLinkFrameGz;
   std::shared_ptr<GzMultiBody> body;
 
   bool isNestedModel = false;
@@ -194,6 +195,7 @@ struct ModelInfo
       world(std::move(_world)),
       rootLinkToModelTf(_rootLinkToModelTf),
       baseInertiaToLinkFrame(_baseInertiaToLinkFrame),
+      baseInertiaToLinkFrameGz(gz::math::eigen3::convert(_baseInertiaToLinkFrame)),
       body(std::move(_body))
   {
     // Do nothing
@@ -232,6 +234,7 @@ struct LinkInfo
   std::optional<int> indexInModel;
   Identity model;
   Eigen::Isometry3d inertiaToLinkFrame;
+  gz::math::Pose3d inertiaToLinkFrameGz;
   std::unique_ptr<GzMultiBodyLinkCollider> collider = nullptr;
   std::unique_ptr<btCompoundShape> shape = nullptr;
   std::vector<std::size_t> collisionEntityIds = {};
@@ -390,17 +393,17 @@ inline gz::math::Pose3d GetWorldTransformOfLink(
 {
   if (linkInfo.collider)
   {
-    return convert(linkInfo.collider->getWorldTransform()) * linkInfo.inertiaToLinkFrame;
+    return ConvertToGzPose(linkInfo.collider->getWorldTransform()) * linkInfo.inertiaToLinkFrameGz;
   }
   const auto &body = *model.body;
   const auto indexOpt = linkInfo.indexInModel;
   if (indexOpt.has_value())
   {
-    return convert(GetWorldTransformOfLinkInertiaFrame(body, *indexOpt))
-        * linkInfo.inertiaToLinkFrame;
+    return ConvertToGzPose(GetWorldTransformOfLinkInertiaFrame(body, *indexOpt))
+        * linkInfo.inertiaToLinkFrameGz;
   }
 
-  return convert(body.getBaseWorldTransform()) * model.baseInertiaToLinkFrame;
+  return ConvertToGzPose(body.getBaseWorldTransform()) * model.baseInertiaToLinkFrameGz;
 }
 
 /////////////////////////////////////////////////

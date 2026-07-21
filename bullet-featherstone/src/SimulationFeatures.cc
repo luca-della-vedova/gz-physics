@@ -358,7 +358,7 @@ void SimulationFeatures::Write(WorldPoses &_worldPoses) const
   {
     const auto &model = this->ReferenceInterface<ModelInfo>(info->model);
     WorldPose wp;
-    wp.pose = gz::math::eigen3::convert(GetWorldTransformOfLink(*model, *info));
+    wp.pose = GetWorldTransformOfLink(*model, *info);
     wp.body = id;
     _worldPoses.entries.push_back(wp);
   }

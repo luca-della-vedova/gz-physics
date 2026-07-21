@@ -28,11 +28,13 @@ FrameData3d getNonBaseLinkFrameData(const ModelInfo *_modelInfo,
 {
   const auto index = _linkInfo->indexInModel.value();
   FrameData3d data;
+  /*
   data.pose = GetWorldTransformOfLink(*_modelInfo, *_linkInfo);
 
   const auto &link = _modelInfo->body->getLink(index);
   data.linearVelocity = convert(link.m_absFrameTotVelocity.getLinear());
   data.angularVelocity = convert(link.m_absFrameTotVelocity.getAngular());
+  */
   return data;
 }
 

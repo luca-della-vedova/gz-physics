@@ -964,7 +964,8 @@ Identity SDFFeatures::ConstructSdfModelImpl(
       std::nullopt,
       this->GenerateIdentity(rootLinkModelID, rootLinkModelInfo),
       gz::math::eigen3::convert(
-      otherStructure.linkToPrincipalAxesPose).inverse()
+      otherStructure.linkToPrincipalAxesPose).inverse(),
+      otherStructure.linkToPrincipalAxesPose.Inverse()
     });
     gzwarn << "Floating body / sub-tree detected. Disabling link: '"
            << otherStructure.rootLink->Name() << "' "
