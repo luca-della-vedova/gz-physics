@@ -362,7 +362,7 @@ inline Eigen::Isometry3d convert(const btTransform& tf)
 {
   Eigen::Isometry3d output;
   output.translation() = convert(tf.getOrigin());
-  output.linear() = convert(btMatrix3x3(tf.getRotation()));
+  output.linear() = convert(tf.getBasis());
   return output;
 }
 
@@ -377,10 +377,21 @@ inline btTransform GetWorldTransformOfLinkInertiaFrame(
   return btTransform(rot, p);
 }
 
-inline Eigen::Isometry3d GetWorldTransformOfLink(
+inline gz::math::Pose3d ConvertToGzPose(const btTransform& tf)
+{
+   const auto& trans = tf.getOrigin();
+   const auto& rot = tf.getRotation();
+   return {trans.x(), trans.y(), trans.z(), rot.w(), rot.x(), rot.y(), rot.z()};
+}
+
+inline gz::math::Pose3d GetWorldTransformOfLink(
     const ModelInfo &model,
     const LinkInfo &linkInfo)
 {
+  if (linkInfo.collider)
+  {
+    return convert(linkInfo.collider->getWorldTransform()) * linkInfo.inertiaToLinkFrame;
+  }
   const auto &body = *model.body;
   const auto indexOpt = linkInfo.indexInModel;
   if (indexOpt.has_value())
