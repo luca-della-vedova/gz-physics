@@ -5,6 +5,10 @@ common --lockfile_mode=off
 build --cxxopt=-std=c++17
 build --host_cxxopt=-std=c++17
 
+# MuJoCo internal C++ sources require C++20.
+build --per_file_copt=external/.*mujoco.*\.cc$@-std=c++20
+build --host_per_file_copt=external/.*mujoco.*\.cc$@-std=c++20
+
 build --force_pic
 build --strip=never
 build --strict_system_includes

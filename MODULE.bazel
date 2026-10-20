@@ -9,8 +9,15 @@ bazel_dep(name = "bullet", version = "3.26.0-rc0.bcr.1")
 bazel_dep(name = "dartsim", version = "6.13.2.bcr.3")
 bazel_dep(name = "eigen", version = "3.4.0.bcr.3")
 bazel_dep(name = "googletest", version = "1.17.0.bcr.2")
+bazel_dep(name = "mujoco")
 bazel_dep(name = "rules_cc", version = "0.1.2")
 bazel_dep(name = "rules_license", version = "1.0.0")
+
+git_override(
+    module_name = "mujoco",
+    commit = "a892750516336d8358949f4518fcc4fbbd85beae",  # 3.16.0
+    remote = "https://github.com/google-deepmind/mujoco.git",
+)
 
 # Gazebo Dependencies
 bazel_dep(name = "rules_gazebo", version = "0.0.6")

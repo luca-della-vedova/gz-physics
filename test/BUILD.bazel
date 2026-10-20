@@ -20,6 +20,7 @@ cc_library(
     ],
     defines = [
         'dartsim_plugin_LIB=\\"dartsim/libgz-physics-dartsim-plugin.so\\"',
+        'mujoco_plugin_LIB=\\"mujoco/libgz-physics-mujoco-plugin.so\\"',
         'tpe_plugin_LIB=\\"tpe/libgz-physics-tpe-plugin.so\\"',
     ],
     includes = [
@@ -109,6 +110,36 @@ common_tests = glob(
     env = {
         "GZ_BAZEL": "1",
         "LIB_TO_TEST": "bullet-featherstone/libgz-physics-bullet-featherstone-plugin.so",
+    },
+    deps = [
+        ":test_headers",
+        "//:gz-physics",
+        "//:mesh",
+        "//:sdf",
+        "@eigen",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@gz-common//:gz-common",
+        "@gz-common//graphics:graphics",
+        "@gz-math//:gz-math",
+        "@gz-math//eigen3:eigen3",
+        "@gz-plugin//:core",
+        "@gz-plugin//:loader",
+        "@sdformat",
+    ],
+) for test in common_tests]
+
+[cc_test(
+    name = "%s_mujoco" % test.replace("/", "_").replace(".cc", ""),
+    srcs = [
+        "%s" % test,
+    ],
+    data = [
+        "//mujoco:libgz-physics-mujoco-plugin.so",
+    ],
+    env = {
+        "GZ_BAZEL": "1",
+        "LIB_TO_TEST": "mujoco/libgz-physics-mujoco-plugin.so",
     },
     deps = [
         ":test_headers",

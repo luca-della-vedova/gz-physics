@@ -1,0 +1,430 @@
+/*
+ * Copyright (C) 2025 Open Source Robotics Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+#ifndef GZ_PHYSICS_MUJOCO_BASE_HH_
+#define GZ_PHYSICS_MUJOCO_BASE_HH_
+
+#include <mujoco/mujoco.h>
+
+#include <Eigen/Geometry>
+#include <cstddef>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <gz/math/AxisAlignedBox.hh>
+#include <gz/math/Pose3.hh>
+#include <gz/math/Quaternion.hh>
+#include <gz/math/SemanticVersion.hh>
+#include <gz/math/Vector3.hh>
+#include <gz/math/eigen3/Conversions.hh>
+#include <gz/physics/Geometry.hh>
+#include <gz/physics/Implements.hh>
+#include <gz/physics/detail/EntityStorage.hh>
+#include <gz/physics/mujoco-plugin/Export.hh>
+
+namespace gz
+{
+namespace physics
+{
+namespace mujoco
+{
+/// \brief A magic number embedded in mjData->userdata to safely verify
+/// ownership of the stored pointer during the global ContactFilterCallback.
+/// The bytes spell out 'GZPHGZPH'.
+///
+/// Example of how this helps: MuJoCo's `mjcb_contactfilter` is a global
+/// callback that fires for *every* mjModel evaluated in the current process.
+/// If a user runs a different MuJoCo simulation (not managed by gz-physics)
+/// in the same process, and they happen to store a float value like `3.14` in
+/// `userdata`, the global callback would try to reinterpret `3.14` as a pointer
+/// and segfault. The magic number ensures we only unpack the pointer if the
+/// userdata was strictly injected by our plugin.
+constexpr uint64_t kUserDataMagicNumber = 0x475A5048475A5048ULL;
+
+/// \brief Format the scoped name of a joint axis, appending a suffix
+/// for secondary degrees of freedom if the axis index is greater than 0.
+/// \param[in] _scopedJointName The standard pre-scoped joint name string.
+/// \param[in] _dof The specific degree-of-freedom (axis index) of the joint.
+/// \return The formatted joint/axis name string.
+inline std::string getJointAxisName(const std::string &_scopedJointName,
+                                    std::size_t _dof)
+{
+  std::string name = _scopedJointName;
+  if (_dof > 0)
+  {
+    name += "_axis" + std::to_string(_dof + 1);
+  }
+  return name;
+}
+
+inline void copyPos(const math::Vector3d &_src, mjtNum *_dst)
+{
+  _dst[0] = _src.X();
+  _dst[1] = _src.Y();
+  _dst[2] = _src.Z();
+}
+
+inline void copyPos(const Eigen::Vector3d &_src, mjtNum *_dst)
+{
+  _dst[0] = _src.x();
+  _dst[1] = _src.y();
+  _dst[2] = _src.z();
+}
+
+inline void copyQuat(const math::Quaterniond &_src, mjtNum *_dst)
+{
+  _dst[0] = _src.W();
+  _dst[1] = _src.X();
+  _dst[2] = _src.Y();
+  _dst[3] = _src.Z();
+}
+
+inline void copyQuat(const Eigen::Quaterniond &_src, mjtNum *_dst)
+{
+  _dst[0] = _src.w();
+  _dst[1] = _src.x();
+  _dst[2] = _src.y();
+  _dst[3] = _src.z();
+}
+
+inline Eigen::Vector3d convertPos(const mjtNum *_src)
+{
+  Eigen::Vector3d dst;
+  dst.x() = _src[0];
+  dst.y() = _src[1];
+  dst.z() = _src[2];
+  return dst;
+}
+
+inline Eigen::Quaterniond convertQuat(const mjtNum *_src)
+{
+  Eigen::Quaterniond dst;
+  dst.w() = _src[0];
+  dst.x() = _src[1];
+  dst.y() = _src[2];
+  dst.z() = _src[3];
+  return dst;
+}
+
+/// \brief Convert a pose given in a position and quaternion pair from MuJoCo
+/// to Eigen.
+/// \param[in] _pos Position array from MuJoCo
+/// \param[in] _quat Quaternion array from MuJoCo
+/// \return The constructed Eigen pose
+inline Eigen::Isometry3d convertPose(const mjtNum *_pos, const mjtNum *_quat)
+{
+  return Eigen::Translation3d(convertPos(_pos)) * convertQuat(_quat);
+}
+
+/// \brief Convert pose from gz::math to Eigen
+/// \param[in] _pose Input gz::math pose
+/// \return Converted Eigen pose
+inline Eigen::Isometry3d convertPose(const gz::math::Pose3d &_pose)
+{
+  return gz::math::eigen3::convert(_pose);
+}
+
+/// \brief Retrieve the pose of a body inside mjData as a gz::math pose.
+/// \param[in] _d mjData pointer
+/// \param[in] _bodyId The body ID
+/// \return Converted gz::math pose
+inline gz::math::Pose3d getBodyWorldPoseFromMjData(const mjData *_d, int
+                                                   _bodyId)
+{
+  return gz::math::Pose3d(_d->xpos[3 * _bodyId],
+                          _d->xpos[3 * _bodyId + 1],
+                          _d->xpos[3 * _bodyId + 2],
+                          _d->xquat[4 * _bodyId],
+                          _d->xquat[4 * _bodyId + 1],
+                          _d->xquat[4 * _bodyId + 2],
+                          _d->xquat[4 * _bodyId + 3]);
+}
+
+/// \brief Retrieve the pose of a body inside mjData as an Eigen pose.
+/// \param[in] _d mjData pointer
+/// \param[in] _bodyId The body ID
+/// \return Converted Eigen pose
+inline Eigen::Isometry3d getBodyWorldPoseFromMjDataEigen(const mjData *_d,
+                                                         int _bodyId)
+{
+  Eigen::Isometry3d pose = Eigen::Isometry3d::Identity();
+  pose.linear() =
+      Eigen::Map<const Eigen::Matrix<double, 3, 3, Eigen::RowMajor>>(
+          &_d->xmat[9 * _bodyId]);
+  pose.translation() =
+      Eigen::Map<const Eigen::Vector3d>(&_d->xpos[3 * _bodyId]);
+  return pose;
+}
+
+// Forward declarations
+struct LinkInfo;
+struct ModelInfo;
+struct WorldInfo;
+
+struct ShapeInfo
+{
+  ShapeInfo(std::size_t _entityId, std::shared_ptr<LinkInfo> _linkInfo)
+      : entityId(_entityId), linkInfo(_linkInfo)
+  {
+  }
+  std::size_t entityId;
+  mjsGeom *geom{nullptr};
+  std::string name;
+  std::weak_ptr<LinkInfo> linkInfo;
+  std::optional<uint16_t> categoryMask;
+  WorldInfo *worldInfo{nullptr};
+
+  /// \brief Cached axis-aligned bounding box. Currently only used for meshes.
+  mutable std::optional<gz::physics::AlignedBox3d> cachedAABB;
+};
+
+struct LinkInfo
+{
+  LinkInfo(std::size_t _entityId, std::shared_ptr<ModelInfo> _modelInfo)
+      : entityId(_entityId), modelInfo(_modelInfo)
+  {
+  }
+  std::size_t entityId;
+  mjsBody *body{nullptr};
+  std::string name;
+  std::weak_ptr<ModelInfo> modelInfo;
+  WorldInfo *worldInfo{nullptr};
+  detail::EntityStorage<std::shared_ptr<ShapeInfo>, const mjsGeom *> shapes{};
+};
+
+struct JointInfo;
+
+/// \brief Metadata for a mimic joint constraint relationship.
+/// Couples the state of a follower joint/axis to a leader joint/axis
+/// via a linear relationship (multiplier, offset, reference).
+struct MimicConstraintInfo
+{
+  /// \brief Pointer to the equality constraint spec element in mjSpec.
+  mjsEquality* spec{nullptr};
+
+  /// \brief The compiled equality constraint index in the active mjModel.
+  /// Set to -1 if the constraint is not currently compiled/active.
+  int eqId{-1};
+
+  /// \brief The specific degree-of-freedom (axis index) of the leader joint
+  /// that acts as the driver for this constraint.
+  std::size_t leaderDof{0};
+
+  /// \brief Safe weak reference targeting the follower joint's metadata
+  /// to avoid strong circular dependency cycles and memory leaks.
+  std::weak_ptr<JointInfo> followerJointInfo;
+
+  /// \brief The specific degree-of-freedom (axis index) of the follower joint
+  /// that is constrained by this relationship.
+  std::size_t followerDof{0};
+};
+
+struct JointInfo
+{
+  JointInfo(std::size_t _entityId,
+           std::shared_ptr<ModelInfo> _modelInfo)
+      : entityId(_entityId), modelInfo(_modelInfo)
+  {
+  }
+  std::size_t entityId;
+  mjsJoint *joint{nullptr};
+  mjsBody *childBody{nullptr};
+  // A MuJoCo actuator is used for setting forces and velocity servo commands
+  mjsActuator *actuator{nullptr};
+  // Index of joint in mjData::qpos
+  int nq_index{-1};
+  // Index of joint in mjData::qvel and mjData::qacc
+  int nv_index{-1};
+  std::string name;
+  std::weak_ptr<ModelInfo> modelInfo;
+  WorldInfo* worldInfo{nullptr};
+  std::optional<std::size_t> ballJointCacheIndex{std::nullopt};
+  // Pointer to the screw joint equality constraint in the spec
+  mjsEquality* screwConstraintSpec{nullptr};
+  // Compiled screw joint equality constraint index in mjModel (max 1)
+  std::optional<int> screwEqIndex{std::nullopt};
+  // Mimic constraints where this joint is the leader.
+  // Storing constraints on the leader (rather than the followers) supports:
+  // 1. One-to-many cases where one leader drives multiple followers.
+  // 2. O(num_followers) keyframe updates, avoiding expensive
+  //    O(total_joints) global searches across the entire model.
+  std::vector<MimicConstraintInfo> mimicConstraints;
+  // Pointer to the weld joint equality constraint in the spec
+  mjsEquality* weldConstraintSpec{nullptr};
+  // Compiled weld joint equality constraint index in mjModel (max 1)
+  std::optional<int> weldEqIndex{std::nullopt};
+};
+
+
+struct ModelInfo
+{
+  ModelInfo(std::size_t _entityId, WorldInfo *_worldInfo)
+      : entityId(_entityId), worldInfo(_worldInfo)
+  {
+  }
+  std::size_t entityId;
+  mjsBody *body{nullptr};
+  WorldInfo *worldInfo;
+  /// \brief Default parent body in MuJoCo for this model's root link.
+  /// \details This is used as a fallback if the root link of this model (or
+  /// any of its nested submodels) is not connected to a parent link via a
+  /// joint. Top-level models and free-floating nested models will default to
+  /// having this set to the world body in the spec.
+  mjsBody *parentBody{nullptr};
+  /// \brief Scoped name of the model.
+  std::string name;
+  /// \brief Local name (short name) of the model.
+  std::string localName;
+  /// \brief Initial pose of this model relative to the world frame.
+  /// \details Used to resolve world pose for programmatically constructed
+  /// nested models.
+  math::Pose3d initialModelPoseInWorld;
+  detail::EntityStorage<std::shared_ptr<LinkInfo>, const mjsBody *> links{};
+  detail::EntityStorage<std::shared_ptr<JointInfo>, std::string> joints{};
+  ModelInfo *parentModelInfo{nullptr};
+  std::unordered_map<std::string, std::size_t> nestedModelNameToEntityId{};
+};
+
+struct FrameInfo
+{
+  /// \brief Constructor
+  /// \param[in] _body Body this frame is rigidly attached to
+  /// \param[in] _offset Offset of the frame relative to the body, expressed in
+  /// the body frame.
+  /// \param[in] _worldInfo The worldInfo object associated with the body
+  FrameInfo(const mjsBody *_body, const Eigen::Isometry3d &_offset,
+            WorldInfo *_worldInfo)
+      : body(_body), offset(_offset), worldInfo(_worldInfo)
+  {
+  }
+
+  /// \brief Body this frame is rigidly attached to.
+  const mjsBody *body{nullptr};
+
+  /// \brief Constant pose of this frame expressed in the body frame.
+  const Eigen::Isometry3d offset{Eigen::Isometry3d::Identity()};
+
+  /// \brief The worldInfo object associated with the body. Not const because
+  /// it might be used to Recompile the world
+  WorldInfo *worldInfo{nullptr};
+};
+
+struct WorldInfo
+{
+  ~WorldInfo()
+  {
+    mj_deleteData(this->mjDataObj);
+    mj_deleteModel(this->mjModelObj);
+    mj_deleteSpec(this->mjSpecObj);
+  }
+
+  WorldInfo() = default;
+  WorldInfo(const WorldInfo &) = delete;
+  WorldInfo &operator=(const WorldInfo &) = delete;
+  WorldInfo(WorldInfo &&) = default;
+  WorldInfo &operator=(WorldInfo &&) = default;
+
+  std::size_t entityId{0};
+  mjsBody *body{nullptr};
+  mjSpec *mjSpecObj{nullptr};
+  mjModel *mjModelObj{nullptr};
+  mjData *mjDataObj{nullptr};
+  bool specDirty{true};
+  std::string name{};
+  std::vector<std::shared_ptr<JointInfo>> joints{};
+  // Key2 is the scoped name of the model, including the world name
+  detail::EntityStorage<std::shared_ptr<ModelInfo>, std::string> models;
+
+  /// \brief Vector mapping each body_weldid to a dynamic cluster ID,
+  /// or -1 if the body is not part of any dynamic weld constraint.
+  std::vector<int> dynamicWeldClusterMap;
+
+  // Vector of ShapeInfo, indexed by mujoco geom id
+  std::vector<std::shared_ptr<ShapeInfo>> geomIdToShapeInfo{};
+
+  /// \brief body poses from the most recent pose change/update.
+  /// The index is the MuJoCo body ID, and the value is the body's pose.
+  std::vector<std::optional<gz::math::Pose3d>> prevBodyPoses{};
+
+  /// \brief Cache for ball joint positions. This is used to enable
+  /// setting individual DOFs of a ball joint's angle axis representation.
+  /// The index of a joint into this cache is stored in the JointInfo.
+  /// The cache is invalidated right before mj_step in
+  /// SimulationFeatures::WorldForwardStep
+  std::vector<std::optional<Eigen::Vector3d>> ballJointPositionsCache{};
+
+  /// \brief Store whether a joint command has been received in this step. This
+  /// is used to choose whether to return the current commanded force or the
+  /// computed force from the last step.
+  std::vector<uint8_t> jointForceCmdReceived;
+
+  /// \brief Recompute rigid cluster connected components from active fixed
+  /// joints. Updates dynamicWeldClusterMap.
+  void UpdateWeldExclusions();
+};
+
+/// \brief Compute the mapping from body_weldid to dynamic cluster ID based
+/// on current dynamic weld constraints.
+/// \param[in] extraEdges Optional list of additional (weld1, weld2) edges
+/// \return Vector of size m->nbody mapping body_weldid to dynamic cluster ID
+/// (-1 if none)
+// Make the symbol visible so that it can be called from a unit test.
+GZ_PHYSICS_MUJOCO_PLUGIN_VISIBLE
+std::vector<int> ComputeWeldExclusions(
+    const mjModel *_m, const mjData *_d,
+    const std::vector<std::pair<int, int>> &_extraEdges = {});
+
+class Base
+{
+  public: virtual ~Base() = default;
+
+  // Note: Entity ID 0 is reserved for the "engine"
+  public: std::size_t entityCount = 1;
+
+  public: inline std::size_t GetNextEntity()
+  {
+    return entityCount++;
+  }
+
+  public: static inline std::string JoinNames(const std::string &_parent,
+                                       const std::string &_name)
+  {
+    return _parent + "::" + _name;
+  }
+
+
+  public: detail::EntityStorage<std::shared_ptr<WorldInfo>, std::string> worlds;
+  public: std::unordered_map<std::size_t, std::shared_ptr<FrameInfo>> frames{};
+
+  public: const std::string engineName{"mujoco"};
+  public: const gz::math::SemanticVersion engineVersion{mj_versionString()};
+
+  /// \brief Recompile the model from the spec if it is dirty, refreshing the
+  /// cached joint indices and mjData buffers. Does nothing when current.
+  /// \param[in,out] _worldInfo World whose spec is recompiled if dirty.
+  /// \return True on success or if no recompile was needed.
+  public: bool RecompileSpec(WorldInfo &_worldInfo) const;
+};
+}  // namespace mujoco
+}  // namespace physics
+}  // namespace gz
+
+#endif

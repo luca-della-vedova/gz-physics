@@ -10,6 +10,7 @@ set(tests
   detachable_joint
   free_joint_features
   joint_features
+  joint_basic_features
   joint_mimic_features
   joint_transmitted_wrench_features
   kinematic_features
@@ -103,4 +104,5 @@ foreach(test ${tests})
   configure_common_test("bullet-featherstone" ${test_executable})
   configure_common_test("dartsim" ${test_executable})
   configure_common_test("tpe" ${test_executable})
+  configure_common_test("mujoco" ${test_executable})
 endforeach()

@@ -584,8 +584,10 @@ TYPED_TEST(SimulationFeaturesDynamicsTest, JointDamping)
 
     const auto jointWithDamping =
         world->GetModel("model1")->GetJoint("test_joint");
+    ASSERT_TRUE(jointWithDamping);
     const auto jointWithoutDamping =
         world->GetModel("model2")->GetJoint("test_joint");
+    ASSERT_TRUE(jointWithoutDamping);
 
     // The following section verifies that the dynamics of the two models with
     // and without damping are computed correctly upto integration errors.
@@ -740,8 +742,10 @@ TYPED_TEST(SimulationFeaturesDynamicsTest, JointSpringStiffnessPrismatic)
 
     const auto jointWithSpringStiffness =
         world->GetModel("model1")->GetJoint("test_joint");
+    ASSERT_TRUE(jointWithSpringStiffness);
     const auto jointWithoutSpringStiffness =
         world->GetModel("model2")->GetJoint("test_joint");
+    ASSERT_TRUE(jointWithoutSpringStiffness );
 
     StepWorld<FeaturesDynamics>(world, true, 1);
     double posSpringInitialPos = jointWithSpringStiffness->GetPosition(0);
@@ -886,8 +890,10 @@ TYPED_TEST(SimulationFeaturesDynamicsTest, JointSpringStiffnessRevolute)
 
     const auto jointWithSpringStiffness =
         world->GetModel("model1")->GetJoint("test_joint");
+    ASSERT_TRUE(jointWithSpringStiffness);
     const auto jointWithoutSpringStiffness =
         world->GetModel("model2")->GetJoint("test_joint");
+    ASSERT_TRUE(jointWithoutSpringStiffness );
 
     StepWorld<FeaturesDynamics>(world, true, 1);
     double posSpringInitialPos = jointWithSpringStiffness->GetPosition(0);
@@ -1566,6 +1572,73 @@ TEST_F(SimulationFeaturesCategoryFilter, CategoryBitmasks)
     expectedCollisions["category_a_box_0"].push_back("category_b_box_1");
 
     checkCollisions(contacts3, expectedCollisions);
+  }
+}
+
+/////////////////////////////////////////////////
+TEST_F(SimulationFeaturesCategoryFilter, BitmaskSetGetRoundtrip)
+{
+  for (const std::string &name : this->pluginNames)
+  {
+    auto world = LoadPluginAndWorld<FeaturesCategoryFilter>(
+      this->loader,
+      name,
+      common_test::worlds::kShapesBitmaskWorld);
+    ASSERT_NE(nullptr, world);
+
+    auto collidingBox = world->GetModel("box_colliding");
+    ASSERT_NE(nullptr, collidingBox);
+    auto shape = collidingBox->GetLink(0)->GetShape(0);
+    ASSERT_NE(nullptr, shape);
+
+    // Initial state: category mask tracks collision mask if not set
+    const uint16_t mask = 0x1234;
+    shape->SetCollisionFilterMask(mask);
+    EXPECT_EQ(mask, shape->GetCollisionFilterMask());
+    EXPECT_EQ(mask, shape->GetCategoryFilterMask());
+
+    // Setting category mask breaks the tracking
+    const uint16_t catMask = 0x5678;
+    shape->SetCategoryFilterMask(catMask);
+    EXPECT_EQ(catMask, shape->GetCategoryFilterMask());
+    EXPECT_EQ(mask, shape->GetCollisionFilterMask());
+
+    // Setting collision mask again does NOT change category mask
+    const uint16_t mask2 = 0x9ABC;
+    shape->SetCollisionFilterMask(mask2);
+    EXPECT_EQ(mask2, shape->GetCollisionFilterMask());
+    EXPECT_EQ(catMask, shape->GetCategoryFilterMask());
+  }
+}
+
+/////////////////////////////////////////////////
+TEST_F(SimulationFeaturesCategoryFilter, RemoveCategoryMask)
+{
+  for (const std::string &name : this->pluginNames)
+  {
+    auto world = LoadPluginAndWorld<FeaturesCategoryFilter>(
+      this->loader,
+      name,
+      common_test::worlds::kShapesBitmaskWorld);
+    ASSERT_NE(nullptr, world);
+
+    auto collidingBox = world->GetModel("box_colliding");
+    ASSERT_NE(nullptr, collidingBox);
+    auto shape = collidingBox->GetLink(0)->GetShape(0);
+    ASSERT_NE(nullptr, shape);
+
+    shape->SetCollisionFilterMask(0x00FF);
+    shape->SetCategoryFilterMask(0x1234);
+
+    shape->RemoveCategoryFilterMask();
+
+    // Now it should track again
+    EXPECT_EQ(0x00FF, shape->GetCollisionFilterMask());
+    EXPECT_EQ(0x00FF, shape->GetCategoryFilterMask());
+
+    shape->SetCollisionFilterMask(0xF000);
+    EXPECT_EQ(0xF000, shape->GetCollisionFilterMask());
+    EXPECT_EQ(0xF000, shape->GetCategoryFilterMask());
   }
 }
 

@@ -1,0 +1,1291 @@
+/*
+ * Copyright (C) 2026 Open Source Robotics Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <memory>
+#include <numeric>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include <Eigen/Geometry>
+#include <gz/common/Console.hh>
+#include <gz/math/Helpers.hh>
+#include <mujoco/mujoco.h>
+#include <sdf/Types.hh>
+#include "Base.hh"
+#include "gz/physics/Geometry.hh"
+
+#include "JointFeatures.hh"
+
+namespace gz {
+namespace physics {
+namespace mujoco {
+
+namespace  {
+
+void setActuatorMode(mjModel *_m, int _actuatorId, bool _isVelocity)
+{
+  const mjtBias targetBias = _isVelocity ? mjBIAS_AFFINE : mjBIAS_NONE;
+
+  if (_m->actuator_biastype[_actuatorId] == targetBias)
+  {
+    return;
+  }
+
+  _m->actuator_biastype[_actuatorId] = targetBias;
+
+  mju_zero(_m->actuator_gainprm + _actuatorId * mjNGAIN, mjNGAIN);
+  mju_zero(_m->actuator_biasprm + _actuatorId * mjNBIAS, mjNBIAS);
+
+  if (!_isVelocity)
+  {
+    // In force control/passive mode (mjBIAS_NONE):
+    // - gainprm[0] is set to 1.0 so the output force matches the ctrl input.
+    _m->actuator_gainprm[_actuatorId * mjNGAIN] = 1.0;
+  }
+  // The gain parameters for velocity mode are dynamically computed and set
+  // in SimulationFeatures::WorldStep to maintain a uniform tracking response.
+}
+
+Eigen::Vector3d *getBallJointPositionImpl(JointInfo *jointInfo)
+{
+  auto *d = jointInfo->worldInfo->mjDataObj;
+  auto &cache = jointInfo->worldInfo->ballJointPositionsCache;
+
+  if (!jointInfo->ballJointCacheIndex)
+  {
+    gzerr << "Ball joint cache index is not set for ["
+          << jointInfo->name << "]\n";
+    return nullptr;
+  }
+
+  if (*jointInfo->ballJointCacheIndex >= cache.size())
+  {
+    gzerr << "Ball joint cache index is outside of cache bounds for joint ["
+          << jointInfo->name << "]\n";
+    return nullptr;
+  }
+  auto &jointPos = cache[*jointInfo->ballJointCacheIndex];
+  if (!jointPos)
+  {
+    const double *mjQuat = &d->qpos[jointInfo->nq_index];
+    Eigen::AngleAxisd angleAxis{
+        Eigen::Quaterniond(mjQuat[0], mjQuat[1], mjQuat[2], mjQuat[3])};
+    jointPos = angleAxis.axis() * angleAxis.angle();
+  }
+
+  return &jointPos.value();
+}
+
+double getJointPositionImpl(JointInfo *jointInfo, std::size_t _dof)
+{
+  auto *d = jointInfo->worldInfo->mjDataObj;
+  if (jointInfo->joint->type == mjtJoint::mjJNT_BALL)
+  {
+    // Ball joints have to be handled differently because the three DOFs exposed
+    // in the public API actually represent the components of an Angle Axis
+    // representation. We allow setting invididual components (DOFs) here, but
+    // convert to quaternion and update mjData right before stepping in
+    // SimulationFeatures.
+
+    const Eigen::Vector3d * jointPos = getBallJointPositionImpl(jointInfo);
+    if (jointPos)
+    {
+      return (*jointPos)[_dof];
+    }
+    return math::NAN_D;
+  }
+  return d->qpos[jointInfo->nq_index + _dof];
+}
+
+void setJointPositionImpl(JointInfo *jointInfo, std::size_t _dof, double _value)
+{
+  auto *d = jointInfo->worldInfo->mjDataObj;
+  if (jointInfo->joint->type == mjtJoint::mjJNT_BALL)
+  {
+    // Ball joints have to be handled differently because the three DOFs exposed
+    // in the public API actually represent the components of an Angle Axis
+    // representation. We allow setting invididual components (DOFs) here, but
+    // convert to quaternion and update mjData right before stepping in
+    // SimulationFeatures.
+    Eigen::Vector3d *jointPos = getBallJointPositionImpl(jointInfo);
+    if (jointPos)
+    {
+      (*jointPos)[_dof] = _value;
+      const double angle = jointPos->norm();
+      if (math::equal(angle, 0.0, 1e-10))
+      {
+        copyQuat(Eigen::Quaterniond::Identity(), &d->qpos[jointInfo->nq_index]);
+      }
+      else
+      {
+        const Eigen::Quaterniond newQuat{
+            Eigen::AngleAxisd{angle, *jointPos / angle}};
+        copyQuat(newQuat, &d->qpos[jointInfo->nq_index]);
+      }
+    }
+  }
+  else
+  {
+    d->qpos[jointInfo->nq_index + _dof] = _value;
+  }
+}
+
+void updateScrewJointFollower(
+    JointInfo *_jointInfo, double _value, double *_mjDataArray, int _baseIndex)
+{
+  if (!_jointInfo->screwEqIndex.has_value())
+    return;
+
+  auto *m = _jointInfo->worldInfo->mjModelObj;
+  const int eqId = *_jointInfo->screwEqIndex;
+  const double multiplier = m->eq_data[eqId * mjNEQDATA + 1];
+
+  // Since the primary rotational hinge and secondary translational slide
+  // joints are created sequentially on the child body back-to-back in
+  // SDFFeatures.cc, and MuJoCo compiles a body's joints contiguously in
+  // memory, the follower's state index is guaranteed to be exactly
+  // _baseIndex + 1.
+  _mjDataArray[_baseIndex + 1] = _value * multiplier;
+}
+
+void updateMimicJointFollowers(JointInfo *_jointInfo, std::size_t _dof,
+                               double _value, double *_mjDataArray,
+                               bool _isQpos)
+{
+  auto *m = _jointInfo->worldInfo->mjModelObj;
+  for (auto &constraint : _jointInfo->mimicConstraints)
+  {
+    if (constraint.eqId < 0 || constraint.eqId >= m->neq)
+      continue;
+
+    // Only update if this constraint targets the DOF/axis currently being set
+    if (constraint.leaderDof != _dof)
+      continue;
+
+    auto followerInfo = constraint.followerJointInfo.lock();
+    if (!followerInfo)
+      continue;
+
+    if (followerInfo->nq_index < 0 || followerInfo->nv_index < 0)
+      continue;
+
+    int followerAddr = _isQpos
+        ? followerInfo->nq_index + constraint.followerDof
+        : followerInfo->nv_index + constraint.followerDof;
+
+    const double multiplier = m->eq_data[constraint.eqId * mjNEQDATA + 1];
+    if (_isQpos)
+    {
+      const double offsetTerm = m->eq_data[constraint.eqId * mjNEQDATA + 0];
+      _mjDataArray[followerAddr] = multiplier * _value + offsetTerm;
+    }
+    else
+    {
+      _mjDataArray[followerAddr] = _value * multiplier;
+    }
+  }
+}
+
+struct MimicConstraintSearchResult
+{
+  std::shared_ptr<JointInfo> leader{nullptr};
+  std::size_t index{0};
+  bool found{false};
+};
+
+/// \brief Search our C++ tracking structures to find an existing mimic joint
+/// constraint relationship matching a given follower joint and active DOF.
+/// \param[in] _worldInfo The metadata block of the active simulation world.
+/// \param[in] _followerJoint Strong pointer targeting the follower JointInfo.
+/// \param[in] _followerDof The degree-of-freedom of the follower axis.
+/// \return A structured search result indicating if the constraint was
+/// found, along with its leader joint pointer and its vector index.
+MimicConstraintSearchResult findMimicConstraint(
+    const WorldInfo &_worldInfo,
+    const std::shared_ptr<JointInfo> &_followerJoint,
+    std::size_t _followerDof)
+{
+  for (const auto &model : _worldInfo.models.idToObject)
+  {
+    for (const auto &joint : model.second->joints.idToObject)
+    {
+      const auto &jInfo = joint.second;
+      for (std::size_t i = 0; i < jInfo->mimicConstraints.size(); ++i)
+      {
+        const auto &c = jInfo->mimicConstraints[i];
+        if (c.followerDof == _followerDof &&
+            c.followerJointInfo.lock() == _followerJoint)
+        {
+          return {jInfo, i, true};
+        }
+      }
+    }
+  }
+  return {nullptr, 0, false};
+}
+}
+
+/////////////////////////////////////////////////
+double JointFeatures::GetJointPosition(
+    const Identity &_id, std::size_t _dof) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot get position for joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return math::NAN_D;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  if (jointInfo->nq_index < 0)
+    return math::NAN_D;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return math::NAN_D;
+  }
+  return getJointPositionImpl(jointInfo, _dof);
+}
+
+/////////////////////////////////////////////////
+double JointFeatures::GetJointVelocity(
+    const Identity &_id, std::size_t _dof) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot get velocity for joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return math::NAN_D;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  if (jointInfo->nv_index < 0)
+    return math::NAN_D;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return math::NAN_D;
+  }
+  return jointInfo->worldInfo->mjDataObj->qvel[jointInfo->nv_index + _dof];
+}
+
+/////////////////////////////////////////////////
+double JointFeatures::GetJointAcceleration(
+    const Identity &_id, std::size_t _dof) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot get acceleration for joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return math::NAN_D;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  if (jointInfo->nv_index < 0)
+    return math::NAN_D;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return math::NAN_D;
+  }
+  return jointInfo->worldInfo->mjDataObj->qacc[jointInfo->nv_index + _dof];
+}
+
+/////////////////////////////////////////////////
+double JointFeatures::GetJointForce(
+    const Identity &_id, std::size_t _dof) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot get force for joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return gz::math::NAN_D;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  if (jointInfo->nv_index < 0)
+    return math::NAN_D;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return math::NAN_D;
+  }
+
+  if (!jointInfo->actuator)
+  {
+    gzerr << "No actuator set up for this joint\n";
+    return math::NAN_D;
+  }
+  // If SetJointForce was called before a physics step has run, returning
+  // d->ctrl directly ensures GetJointForce immediately reflects the commanded
+  // force before mj_forward computes d->qfrc_actuator.
+  auto *m = jointInfo->worldInfo->mjModelObj;
+  auto *d = jointInfo->worldInfo->mjDataObj;
+
+  const int actuatorId =
+    mjs_getId(jointInfo->actuator->element) + static_cast<int>(_dof);
+
+  if (actuatorId >= 0 && m->actuator_biastype[actuatorId] == mjBIAS_NONE &&
+    jointInfo->worldInfo->jointForceCmdReceived[jointInfo->nv_index + _dof])
+  {
+    return d->ctrl[actuatorId];
+  }
+
+  return d->qfrc_actuator[jointInfo->nv_index + _dof];
+}
+
+/////////////////////////////////////////////////
+Pose3d JointFeatures::GetJointTransform(const Identity &_id) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+  if (!jointInfo->joint)
+  {
+    return this->GetJointTransformFromParent(_id) *
+           this->GetJointTransformToChild(_id);
+  }
+  auto m = jointInfo->worldInfo->mjModelObj;
+  int childBodyId = mjs_getId(jointInfo->childBody->element);
+  if (childBodyId < 0 || childBodyId > m->nbody)
+    return {};
+
+  auto *parentBody = mjs_getParent(jointInfo->childBody->element);
+  int parentBodyId = mjs_getId(parentBody ->element);
+
+  auto d = jointInfo->worldInfo->mjDataObj;
+  Eigen::Isometry3d parentPose =
+      getBodyWorldPoseFromMjDataEigen(d, parentBodyId);
+  Eigen::Isometry3d childPose = getBodyWorldPoseFromMjDataEigen(d, childBodyId);
+  return parentPose.inverse() * childPose;
+}
+
+/////////////////////////////////////////////////
+void JointFeatures::SetJointPosition(
+    const Identity &_id, std::size_t _dof, double _value)
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+
+  // Take extra care that the value is finite. A nan might cause the physics
+  // engine to fail
+  if (!std::isfinite(_value))
+  {
+    gzerr << "Invalid joint position value [" << _value << "] set on joint ["
+           << jointInfo->name << " DOF " << _dof
+           << "]. The value will be ignored\n";
+    return;
+  }
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot set position on joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  if (jointInfo->nq_index < 0)
+    return;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return;
+  }
+  setJointPositionImpl(jointInfo, _dof, _value);
+
+  // If this is the primary rotational hinge joint of a screw joint,
+  // simultaneously update the coupled secondary slide joint position (`qpos`)
+  // by `_value * pitch`. This maintains perfect kinematic consistency and
+  // prevents violent solver impulses during state initialization.
+  updateScrewJointFollower(
+      jointInfo, _value, jointInfo->worldInfo->mjDataObj->qpos,
+      jointInfo->nq_index);
+  updateMimicJointFollowers(jointInfo, _dof, _value,
+                            jointInfo->worldInfo->mjDataObj->qpos, true);
+
+  // Only refresh the kinematics that queries read (see WorldForwardStep).
+  // mj_comPos is needed by mj_comVel since cdof depends on qpos. The rest of
+  // mj_forward is recomputed by the next mj_step.
+  auto *m = jointInfo->worldInfo->mjModelObj;
+  auto *d = jointInfo->worldInfo->mjDataObj;
+  mj_kinematics(m, d);
+  mj_comPos(m, d);
+  mj_comVel(m, d);
+}
+
+/////////////////////////////////////////////////
+void JointFeatures::SetJointVelocity(
+    const Identity &_id, std::size_t _dof, double _value)
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+
+  // Take extra care that the value is finite. A nan might cause the physics
+  // engine to fail
+  if (!std::isfinite(_value))
+  {
+    gzerr << "Invalid joint velocity value [" << _value << "] set on joint ["
+           << jointInfo->name << " DOF " << _dof
+           << "]. The value will be ignored\n";
+    return;
+  }
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot set velocity on joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  if (jointInfo->nv_index < 0)
+    return;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return;
+  }
+  jointInfo->worldInfo->mjDataObj->qvel[jointInfo->nv_index + _dof] = _value;
+
+  // If this is the primary rotational hinge joint of a screw joint,
+  // simultaneously update the coupled secondary slide joint velocity (`qvel`)
+  // by `_value * pitch`. This maintains perfect kinematic consistency and
+  // prevents violent solver impulses during state initialization.
+  updateScrewJointFollower(jointInfo, _value,
+                           jointInfo->worldInfo->mjDataObj->qvel,
+                           jointInfo->nv_index);
+  updateMimicJointFollowers(jointInfo, _dof, _value,
+                            jointInfo->worldInfo->mjDataObj->qvel, false);
+
+  // Only qvel changed, so the frame arrays and cdof are still valid and just
+  // cvel needs to be refreshed. The rest of mj_forward is recomputed by the
+  // next mj_step.
+  mj_comVel(jointInfo->worldInfo->mjModelObj, jointInfo->worldInfo->mjDataObj);
+}
+
+/////////////////////////////////////////////////
+void JointFeatures::SetJointAcceleration(
+    const Identity &/* _id */, std::size_t /* _dof */, double /* _value */)
+{
+  gzerr << "Setting joint acceleration is not supported by the MuJoCo physics "
+           "plugin.\n";
+}
+
+/////////////////////////////////////////////////
+void JointFeatures::SetJointForce(
+    const Identity &_id, std::size_t _dof, double _value)
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+
+  // Take extra care that the value is finite. A nan might cause the physics
+  // engine to fail
+  if (!std::isfinite(_value))
+  {
+    gzerr << "Invalid joint force value [" << _value << "] set on joint ["
+           << jointInfo->name << " DOF " << _dof
+           << "]. The value will be ignored\n";
+    return;
+  }
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot set force on joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return;
+  }
+
+  if (!jointInfo->actuator)
+  {
+    gzerr << "No actuator set up for this joint\n";
+    return;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  if (jointInfo->nv_index < 0)
+    return;
+
+  const int ctrlIndex = mjs_getId(jointInfo->actuator->element);
+  if (ctrlIndex < 0)
+    return;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return;
+  }
+
+  auto *worldInfo = jointInfo->worldInfo;
+
+  const int actuatorId = ctrlIndex + static_cast<int>(_dof);
+  setActuatorMode(worldInfo->mjModelObj, actuatorId, false);
+
+  worldInfo->mjDataObj->ctrl[ctrlIndex + _dof] = _value;
+
+  // Even though `mjData.ctrl` is used to set the force, we use `nv_index` to
+  // index into jointForceCmdReceived because there is potential to have
+  // multiple control inputs for a single joint, for example, to implement a PD
+  // controller. Using nv_index allows us to have a 1:1 mapping between Gazebo
+  // joints+dof and jointForceCmdReceived.
+  worldInfo->jointForceCmdReceived[jointInfo->nv_index + _dof] = 1;
+}
+
+/////////////////////////////////////////////////
+void JointFeatures::SetJointVelocityCommand(
+    const Identity &_id, std::size_t _dof, double _value)
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+
+
+  if (!jointInfo->joint)
+  {
+    gzerr << "Cannot set velocity command on joint [" << jointInfo->name
+          << "] because it is a fixed joint.\n";
+    return;
+  }
+
+  if (!jointInfo->actuator)
+  {
+    gzerr << "No actuator set up for this joint\n";
+    return;
+  }
+
+  this->RecompileSpec(*jointInfo->worldInfo);
+
+  const int ctrlIndex = mjs_getId(jointInfo->actuator->element);
+  if (ctrlIndex < 0)
+    return;
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return;
+  }
+
+  if (!std::isfinite(_value))
+  {
+    gzerr << "Invalid joint velocity value [" << _value
+          << "] commanded on joint [" << jointInfo->name << " DOF "
+          << _dof << "]. The command will be ignored\n";
+    // If the velocity command is not finite (e.g. NaN), we ignore the command
+    // and return early. This matches the behavior of DART and
+    // bullet-featherstone.
+    return;
+  }
+
+  const int actuatorId = ctrlIndex + static_cast<int>(_dof);
+  setActuatorMode(jointInfo->worldInfo->mjModelObj, actuatorId, true);
+
+  jointInfo->worldInfo->mjDataObj->ctrl[actuatorId] = _value;
+}
+
+/////////////////////////////////////////////////
+bool JointFeatures::ValidateDofParam(const Identity &_id,
+                                     std::size_t _dof) const
+{
+  if (_dof >= this->GetJointDegreesOfFreedom(_id))
+  {
+    auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+    gzerr << "Trying to access an invalid DOF [" << _dof << "] on joint [ "
+          << jointInfo->name << "]\n";
+    return false;
+  }
+  return true;
+}
+
+/////////////////////////////////////////////////
+std::size_t JointFeatures::GetJointDegreesOfFreedom(const Identity &_id) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+
+  if (!jointInfo->joint)
+  {
+    return 0;
+  }
+  auto m = jointInfo->worldInfo->mjModelObj;
+  int bodyId = mjs_getId(jointInfo->childBody->element);
+  if (bodyId < 0 || bodyId >= m->nbody)
+  {
+    // The joint is not yet compiled in the active model. Count the DOFs
+    // statically from the spec DOM elements!
+    std::size_t dofs = 0;
+    mjsElement* elem = mjs_firstChild(
+        jointInfo->childBody, mjOBJ_JOINT, 0);
+    while (elem)
+    {
+      mjsJoint* j = mjs_asJoint(elem);
+      if (j)
+      {
+        if (j->type == mjJNT_BALL)
+        {
+          dofs += 3;
+        }
+        else if (j->type == mjJNT_FREE)
+        {
+          dofs += 6;
+        }
+        else
+        {
+          dofs += 1;
+        }
+      }
+      elem = mjs_nextChild(jointInfo->childBody, elem, 0);
+    }
+    // For screw joints, the sliding axis is coupled, so subtract 1:
+    if (jointInfo->screwConstraintSpec != nullptr)
+    {
+      dofs -= 1;
+    }
+    return dofs;
+  }
+
+  std::size_t dofs = m->body_dofnum[bodyId];
+  if (jointInfo->screwEqIndex.has_value())
+  {
+    dofs -= 1;
+  }
+  return dofs;
+}
+
+/////////////////////////////////////////////////
+Pose3d JointFeatures::GetJointTransformFromParent(const Identity &_id) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+  auto it = this->frames.find(_id);
+  if (it != this->frames.end())
+  {
+    Pose3d childInParent =
+        convertPose(jointInfo->childBody->pos, jointInfo->childBody->quat);
+    const Pose3d &jointInChild = it->second->offset;
+
+    return childInParent * jointInChild;
+  }
+  return {};
+}
+
+/////////////////////////////////////////////////
+Pose3d JointFeatures::GetJointTransformToChild(const Identity &_id) const
+{
+  auto it = this->frames.find(_id.id);
+  if (it != this->frames.end())
+  {
+    const Pose3d &jointInChild = it->second->offset;
+    return jointInChild.inverse();
+  }
+  return {};
+}
+
+/////////////////////////////////////////////////
+bool JointFeatures::SetJointMimicConstraint(
+    const Identity &_id,
+    std::size_t _dof,
+    const BaseJoint3dPtr &_leaderJoint,
+    std::size_t _leaderAxisDof,
+    double _multiplier,
+    double _offset,
+    double _reference)
+{
+  auto followerJointShared =
+      std::static_pointer_cast<JointInfo>(this->Reference(_id));
+  auto followerJointInfo = followerJointShared.get();
+  if (!followerJointInfo->joint)
+  {
+    gzerr << "Cannot set mimic constraint on joint [" << followerJointInfo->name
+          << "] because it is a fixed joint.\n";
+    return false;
+  }
+
+  if (followerJointInfo->joint->type == mjJNT_BALL)
+  {
+    gzerr << "Cannot set mimic constraint on joint ["
+          << followerJointInfo->name << "] because it is a ball joint.\n";
+    return false;
+  }
+
+  if (!this->ValidateDofParam(_id, _dof))
+  {
+    return false;
+  }
+
+  auto leaderJointId = _leaderJoint->FullIdentity();
+  auto leaderJointShared =
+      std::static_pointer_cast<JointInfo>(this->Reference(leaderJointId));
+  auto leaderJointInfo = leaderJointShared.get();
+  if (!leaderJointInfo->joint)
+  {
+    gzerr << "Cannot mimic joint [" << leaderJointInfo->name
+          << "] because it is a fixed joint.\n";
+    return false;
+  }
+
+  if (leaderJointInfo->joint->type == mjJNT_BALL)
+  {
+    gzerr << "Cannot mimic joint [" << leaderJointInfo->name
+          << "] because it is a ball joint.\n";
+    return false;
+  }
+
+  if (_leaderAxisDof >= this->GetJointDegreesOfFreedom(leaderJointId))
+  {
+    gzerr << "Trying to access an invalid leader DOF [ " << _leaderAxisDof
+          << "] on joint [ " << leaderJointInfo->name << "]\n";
+    return false;
+  }
+
+  auto followerModel = followerJointInfo->modelInfo.lock();
+  auto leaderModel = leaderJointInfo->modelInfo.lock();
+  auto worldInfo = followerJointInfo->worldInfo;
+
+  // Search the leader-to-followers tracking vector lists in C++ memory
+  // to locate if a mimic constraint already exists for this follower
+  // joint axis, preparing it for safe de-duplication/overwriting.
+  const auto searchResult =
+      findMimicConstraint(*worldInfo, followerJointShared, _dof);
+
+  // Unconditionally delete the old constraint if found
+  if (searchResult.found)
+  {
+    // Delete the spec node from MuJoCo's DOM tree
+    mjs_delete(
+        worldInfo->mjSpecObj,
+        searchResult.leader->mimicConstraints[searchResult.index]
+            .spec->element);
+
+    // Erase the record from the old leader's list
+    searchResult.leader->mimicConstraints.erase(
+        searchResult.leader->mimicConstraints.begin() + searchResult.index);
+  }
+
+  const std::string followerName = getJointAxisName(
+      ::sdf::JoinName(followerModel->name, followerJointInfo->name), _dof);
+
+  const std::string leaderName = getJointAxisName(
+      ::sdf::JoinName(leaderModel->name, leaderJointInfo->name),
+      _leaderAxisDof);
+
+  // Recall the linear equation from the definition of the mimic constraint:
+  // follower_pos = multiplier * (leader_pos - reference) + offset
+  //
+  // MuJoCo's official joint equality constraint polynomial is:
+  // y - y0 = a0 + a1*(x - x0) + a2*(x - x0)^2 + a3*(x - x0)^3 + a4*(x - x0)^4
+  // where:
+  // - y is the follower joint position (follower_pos)
+  // - y0 is the follower home/resting position (qpos0_follower)
+  // - x is the leader joint position (leader_pos)
+  // - x0 is the leader home/resting position (qpos0_leader)
+  //
+  // We only need a linear relationship, so we set a2 = a3 = a4 = 0, leaving:
+  // follower_pos - qpos0_follower = a0 + a1 * (leader_pos - qpos0_leader)
+  //
+  // In our MuJoCo plugin, since all standard 1-DOF joints are created with a
+  // zero home configuration (qpos0 = 0), we can substitute qpos0_follower = 0
+  // and qpos0_leader = 0, leaving:
+  // follower_pos = a0 + a1 * leader_pos
+  //
+  // Equating the linear mimic equation and the simplified MuJoCo solver
+  // equation, we solve for the MuJoCo parameters:
+  // 1. a1 (multiplier) = multiplier (saved as eqSpec->data[1])
+  // 2. a0 (offsetTerm) = offset - multiplier * reference
+  //                      (saved as eqSpec->data[0])
+  const double offsetTerm = _offset - _multiplier * _reference;
+
+  mjsEquality* eqSpec = mjs_addEquality(worldInfo->mjSpecObj, nullptr);
+  eqSpec->type = mjEQ_JOINT;
+  eqSpec->active = 1;
+  mjs_setString(eqSpec->name1, followerName.c_str());
+  mjs_setString(eqSpec->name2, leaderName.c_str());
+
+  std::fill(std::begin(eqSpec->data), std::end(eqSpec->data), 0.0);
+  eqSpec->data[0] = offsetTerm;
+  eqSpec->data[1] = _multiplier;
+
+  // Set solver reference parameters (time constant and damping ratio):
+  // - solref[0] = 0.001 (1 ms) defines a stiff, highly responsive constraint
+  //   to minimize kinematic tracking error.
+  // - solref[1] = 1.0 (critical damping) prevents spring-like coordinate
+  //   oscillations during constraint corrections.
+  eqSpec->solref[0] = 0.001;
+  eqSpec->solref[1] = 1.0;
+
+  MimicConstraintInfo constraint;
+  constraint.spec = eqSpec;
+  constraint.eqId = -1;
+  constraint.leaderDof = _leaderAxisDof;
+  constraint.followerJointInfo = followerJointShared;
+  constraint.followerDof = _dof;
+
+  leaderJointInfo->mimicConstraints.push_back(constraint);
+
+  worldInfo->specDirty = true;
+  this->RecompileSpec(*worldInfo);
+  return true;
+}
+void JointFeatures::SetJointTransformFromParent(const Identity &_id,
+                                                const Pose3d &_pose)
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_id);
+  if (!jointInfo)
+  {
+    gzerr << "Failed to find JointInfo when setting transform from parent.\n";
+    return;
+  }
+
+  if (jointInfo->weldConstraintSpec)
+  {
+    auto weldSpec = jointInfo->weldConstraintSpec;
+
+    // Note: The memory layout of `weldSpec->data` (mjNEQDATA=11 elements) for
+    // mjEQ_WELD is:
+    // data[0..2]: anchor (3 elements)
+    // data[3..9]: relpose (7 elements)
+    // data[10]: torquescale (1 element)
+
+    // We choose the anchor point to be the origin of the child link.
+    // Therefore, the anchor in the child frame (data[3..5]) is (0, 0, 0).
+    std::fill(weldSpec->data + 3, weldSpec->data + 6, 0.0);
+
+    // The anchor in the parent frame (data[0..2]) is the origin of the child
+    // link expressed in the parent frame, which is _pose.translation()
+    copyPos(_pose.translation(), weldSpec->data);
+
+    // The relative orientation (data[6..9]) is the parent orientation in the
+    // child frame, which is exactly _pose.inverse().rotation()
+    copyQuat(Eigen::Quaterniond(_pose.inverse().rotation()),
+             weldSpec->data + 6);
+
+    auto m = jointInfo->worldInfo->mjModelObj;
+    if (m)
+    {
+      int eqId = jointInfo->weldEqIndex.value_or(mjs_getId(weldSpec->element));
+      if (eqId >= 0 && eqId < m->neq)
+      {
+        jointInfo->weldEqIndex = eqId;
+        double *eqData = m->eq_data + eqId * mjNEQDATA;
+        std::copy(weldSpec->data, weldSpec->data + mjNEQDATA, eqData);
+      }
+    }
+  }
+  else
+  {
+    auto it = this->frames.find(_id);
+    if (it != this->frames.end())
+    {
+      const Pose3d &jointInChild = it->second->offset;
+      const Pose3d childInParent = _pose * jointInChild.inverse();
+
+      copyPos(childInParent.translation(), jointInfo->childBody->pos);
+      copyQuat(Eigen::Quaterniond(childInParent.linear()),
+               jointInfo->childBody->quat);
+
+      jointInfo->worldInfo->specDirty = true;
+    }
+    else
+    {
+      gzerr << "Failed to find FrameInfo when setting transform from parent.\n";
+    }
+  }
+}
+
+/////////////////////////////////////////////////
+void JointFeatures::DetachJoint(const Identity &_jointId)
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_jointId);
+  if (!jointInfo)
+  {
+    gzerr << "Failed to find JointInfo when detaching joint.\n";
+    return;
+  }
+
+  auto worldInfo = jointInfo->worldInfo;
+  auto modelInfo = jointInfo->modelInfo.lock();
+  if (!worldInfo || !modelInfo)
+  {
+    gzerr << "Invalid worldInfo or modelInfo when detaching joint.\n";
+    return;
+  }
+
+  if (jointInfo->weldConstraintSpec)
+  {
+    jointInfo->weldConstraintSpec->active = 0;
+    int eqId = jointInfo->weldEqIndex.value_or(
+        mjs_getId(jointInfo->weldConstraintSpec->element));
+    if (worldInfo->mjModelObj && worldInfo->mjDataObj &&
+        eqId >= 0 && eqId < worldInfo->mjModelObj->neq)
+    {
+      worldInfo->mjDataObj->eq_active[eqId] = 0;
+    }
+    jointInfo->weldConstraintSpec = nullptr;
+
+    this->frames.erase(jointInfo->entityId);
+
+    modelInfo->joints.RemoveEntity(jointInfo->name);
+
+    worldInfo->UpdateWeldExclusions();
+  }
+}
+
+/////////////////////////////////////////////////
+Identity JointFeatures::CastToFixedJoint(const Identity &_jointID) const
+{
+  auto jointInfo = this->ReferenceInterface<JointInfo>(_jointID);
+  if (jointInfo && jointInfo->weldConstraintSpec)
+  {
+    return _jointID;
+  }
+  return this->GenerateInvalidId();
+}
+
+/////////////////////////////////////////////////
+// Performance Optimization for AttachFixedJoint & DetachJoint:
+// Instead of creating and deleting weld constraints via the mjSpec API (which
+// triggers an expensive full model recompilation `mj_compile` each time a
+// joint is attached or detached), we implement constraint caching/reuse.
+//
+// In DetachJoint, we simply deactivate the constraint (`active = 0`).
+// In AttachFixedJoint, we first use `mjs_findElement` to efficiently look up
+// an existing inactive weld constraint by its name. If found, we reuse it by
+// setting `active = 1` in both the spec and live mjData, updating bodies if
+// necessary.
+// This avoids recompilation entirely for repetitive attach/detach operations.
+Identity JointFeatures::AttachFixedJoint(
+    const Identity &_childID,
+    const BaseLink3dPtr &_parent,
+    const std::string &_name)
+{
+  auto childLinkInfo = this->ReferenceInterface<LinkInfo>(_childID);
+  if (!childLinkInfo)
+  {
+    gzerr << "Failed to find LinkInfo for child entity when attaching fixed "
+          << "joint.\n";
+    return this->GenerateInvalidId();
+  }
+
+  LinkInfo *parentLinkInfo = nullptr;
+  if (_parent)
+  {
+    parentLinkInfo =
+      this->ReferenceInterface<LinkInfo>(_parent->FullIdentity());
+    if (!parentLinkInfo)
+    {
+      gzerr << "Failed to find LinkInfo for parent entity when attaching "
+            << "fixed joint.\n";
+      return this->GenerateInvalidId();
+    }
+  }
+
+  auto worldInfo = childLinkInfo->worldInfo;
+  auto modelInfo = childLinkInfo->modelInfo.lock();
+  if (!worldInfo || !modelInfo)
+  {
+    gzerr << "Invalid worldInfo or modelInfo when attaching fixed joint.\n";
+    return this->GenerateInvalidId();
+  }
+  std::string uniqueName = _name;
+  std::size_t counter = 1;
+  while (modelInfo->joints.HasEntity(uniqueName))
+  {
+    uniqueName = _name + "_" + std::to_string(counter++);
+  }
+
+  const char *childBodyName
+      = mjs_getString(mjs_getName(childLinkInfo->body->element));
+  const char *parentBodyName
+      = parentLinkInfo
+            ? mjs_getString(mjs_getName(parentLinkInfo->body->element))
+            : "";
+
+  const std::string mjJointName = ::sdf::JoinName(modelInfo->name, uniqueName);
+
+  mjsEquality *eqSpec = mjs_asEquality(mjs_findElement(
+      worldInfo->mjSpecObj, mjOBJ_EQUALITY, mjJointName.c_str()));
+
+  bool requireRecompile = false;
+  if (eqSpec)
+  {
+    if (eqSpec->type != mjEQ_WELD)
+    {
+      gzerr
+          << "Found a matching equality constraint, but with incorrect type.\n";
+      return this->GenerateInvalidId();
+    }
+    // If the bodies changed, update the constraint with the new bodies and
+    // force a recompile.
+    // We assume the previous fixed joint with the same name has been detached
+    // (i.e. removed) since the HasEntity check above would have failed
+    // otherwise.
+    const char *n1 = mjs_getString(eqSpec->name1);
+    const char *n2 = mjs_getString(eqSpec->name2);
+    if (!n1 || !n2 || std::string_view(childBodyName) != n1 ||
+        std::string_view(parentBodyName) != n2)
+    {
+      mjs_setString(eqSpec->name1, childBodyName);
+      mjs_setString(eqSpec->name2, parentBodyName);
+      requireRecompile = true;
+    }
+  }
+  if (!eqSpec)
+  {
+    eqSpec = mjs_addEquality(worldInfo->mjSpecObj, nullptr);
+    if (!eqSpec)
+    {
+      gzerr << "Failed to add equality constraint element to the spec.\n";
+      return this->GenerateInvalidId();
+    }
+    mjs_setName(eqSpec->element, mjJointName.c_str());
+    eqSpec->type = mjEQ_WELD;
+    eqSpec->objtype = mjOBJ_BODY;
+    mjs_setString(eqSpec->name1, childBodyName);
+    mjs_setString(eqSpec->name2, parentBodyName);
+
+    // Stiffen the constraint solver parameters to make the weld constraint
+    // virtually rigid
+    eqSpec->solref[0] = 0.0001;  // 100 microseconds time constant
+    eqSpec->solimp[0] = 0.999;   // highly rigid compliance bounds
+    eqSpec->solimp[1] = 0.9999;
+
+    // Fill data with zeros so MuJoCo computes initial relative pose at
+    // compilation. Note that the memory layout for mjEQ_WELD is:
+    // data[0..2] = anchor, data[3..9] = relpose, data[10] = torquescale.
+    std::fill(std::begin(eqSpec->data), std::end(eqSpec->data), 0.0);
+    // Default value for torquescale
+    eqSpec->data[10] = 1.0;
+
+    requireRecompile = true;
+  }
+
+  auto jointInfo =
+    std::make_shared<JointInfo>(this->GetNextEntity(), modelInfo);
+  jointInfo->name = uniqueName;
+  jointInfo->childBody = childLinkInfo->body;
+  jointInfo->worldInfo = worldInfo;
+  jointInfo->weldConstraintSpec = eqSpec;
+
+  eqSpec->active = 1;
+
+  if (worldInfo->mjModelObj && worldInfo->mjDataObj)
+  {
+    int eqId = mjs_getId(eqSpec->element);
+    if (eqId >= 0 && eqId < worldInfo->mjModelObj->neq)
+    {
+      if (!requireRecompile)
+      {
+        jointInfo->weldEqIndex = eqId;
+      }
+      worldInfo->mjDataObj->eq_active[eqId] = 1;
+    }
+  }
+
+  auto childFrameIt = this->frames.find(childLinkInfo->entityId);
+  if (childFrameIt != this->frames.end())
+  {
+    this->frames[jointInfo->entityId] = childFrameIt->second;
+  }
+
+  modelInfo->joints.AddEntity(
+    jointInfo->entityId, jointInfo, uniqueName, modelInfo->entityId);
+
+  if (requireRecompile)
+  {
+    worldInfo->specDirty = true;
+    if (worldInfo->mjModelObj)
+    {
+      int b1 = mjs_getId(childLinkInfo->body->element);
+      int b2 = parentLinkInfo ? mjs_getId(parentLinkInfo->body->element) : 0;
+      if (b1 >= 0 && b2 >= 0 && b1 < worldInfo->mjModelObj->nbody &&
+          b2 < worldInfo->mjModelObj->nbody)
+      {
+        int w1 = worldInfo->mjModelObj->body_weldid[b1];
+        int w2 = worldInfo->mjModelObj->body_weldid[b2];
+        worldInfo->dynamicWeldClusterMap = ComputeWeldExclusions(
+            worldInfo->mjModelObj, worldInfo->mjDataObj, {{w1, w2}});
+      }
+    }
+  }
+  else
+  {
+    worldInfo->UpdateWeldExclusions();
+  }
+
+  return this->GenerateIdentity(jointInfo->entityId, jointInfo);
+}
+
+namespace {
+/// \brief Disjoint-set data structure (Union-Find) to compute connected
+/// components of welded body clusters using contiguous vectors.
+class DisjointSet
+{
+  /// \brief Constructor.
+  /// \param[in] _n Number of elements.
+  public: explicit DisjointSet(std::size_t _n)
+    : parent(_n), weldCount(_n, 1)
+  {
+    std::iota(this->parent.begin(), this->parent.end(), 0);
+  }
+
+  /// \brief Find representative set root with path compression.
+  /// \param[in] _i Element ID.
+  /// \return Root ID.
+  public: int Find(int _i)
+  {
+    if (this->parent[_i] == _i)
+      return _i;
+    return this->parent[_i] = this->Find(this->parent[_i]);
+  }
+
+  /// \brief Merge sets containing _i and _j.
+  /// \param[in] _i First element ID.
+  /// \param[in] _j Second element ID.
+  public: void Union(int _i, int _j)
+  {
+    int rootI = this->Find(_i);
+    int rootJ = this->Find(_j);
+    if (rootI != rootJ)
+    {
+      this->parent[rootI] = rootJ;
+      this->weldCount[rootJ] += this->weldCount[rootI];
+    }
+  }
+
+  /// \brief Return the number of distinct weld groups merged into the set
+  /// containing _i.
+  /// \param[in] _i Element ID.
+  /// \return Count of merged weld groups.
+  public: int WeldCount(int _i)
+  {
+    return this->weldCount[this->Find(_i)];
+  }
+
+  private: std::vector<int> parent;
+  private: std::vector<int> weldCount;
+};
+}  // namespace
+
+/////////////////////////////////////////////////
+std::vector<int> ComputeWeldExclusions(
+    const mjModel *_m, const mjData *_d,
+    const std::vector<std::pair<int, int>> &_extraEdges)
+{
+  if (!_m || !_d)
+    return {};
+
+  std::vector<int> clusterMap(_m->nbody, -1);
+
+  // --------------------------------------------------------------------------
+  // Step 1: Merge Dynamic Welded Connections into Disjoint Sets
+  // --------------------------------------------------------------------------
+
+  // We only add edges for dynamic active fixed joints.
+  // We do NOT need to manually traverse kinematic trees because MuJoCo
+  // natively computes them and assigns rigidly connected bodies the exact
+  // same `body_weldid`.
+  // MuJoCo's broadphase inherently drops collisions where weld1 == weld2.
+  // Our DSU sets will merge these `body_weldid`s, not raw body IDs.
+
+  DisjointSet dsu(_m->nbody);
+
+  auto addEdge = [&](int b1, int b2) {
+    if (b1 >= 0 && b2 >= 0 && b1 < _m->nbody && b2 < _m->nbody)
+    {
+      int w1 = _m->body_weldid[b1];
+      int w2 = _m->body_weldid[b2];
+      if (w1 != w2)
+      {
+        dsu.Union(w1, w2);
+      }
+    }
+  };
+
+  for (int eqId = 0; eqId < _m->neq; ++eqId)
+  {
+    if (_m->eq_type[eqId] == mjEQ_WELD && _d->eq_active[eqId] == 1)
+    {
+      addEdge(_m->eq_obj1id[eqId], _m->eq_obj2id[eqId]);
+    }
+  }
+
+  for (const auto &[w1, w2] : _extraEdges)
+  {
+    if (w1 >= 0 && w2 >= 0 && w1 < _m->nbody && w2 < _m->nbody && w1 != w2)
+    {
+      dsu.Union(w1, w2);
+    }
+  }
+
+  // --------------------------------------------------------------------------
+  // Step 2: Extract Connected Components & Assign Cluster IDs
+  // --------------------------------------------------------------------------
+  // We re-loop over active equality constraints and extra edges to assign
+  // cluster IDs directly to their endpoints. This is O(K) in the number of
+  // active constraints (where K << N_bodies) and avoids extra heap memory
+  // allocations or scanning all N_bodies in the model.
+
+  std::vector<int> rootToClusterId(_m->nbody, -1);
+  int nextClusterId = 0;
+
+  auto assignCluster = [&](int b) {
+    if (b >= 0 && b < _m->nbody)
+    {
+      int w = _m->body_weldid[b];
+      if (dsu.WeldCount(w) > 1)
+      {
+        int root = dsu.Find(w);
+        if (rootToClusterId[root] == -1)
+        {
+          rootToClusterId[root] = nextClusterId++;
+        }
+        clusterMap[w] = rootToClusterId[root];
+      }
+    }
+  };
+
+  for (int eqId = 0; eqId < _m->neq; ++eqId)
+  {
+    if (_m->eq_type[eqId] == mjEQ_WELD && _d->eq_active[eqId] == 1)
+    {
+      assignCluster(_m->eq_obj1id[eqId]);
+      assignCluster(_m->eq_obj2id[eqId]);
+    }
+  }
+
+  for (const auto &[w1, w2] : _extraEdges)
+  {
+    assignCluster(w1);
+    assignCluster(w2);
+  }
+
+  return clusterMap;
+}
+
+/////////////////////////////////////////////////
+void WorldInfo::UpdateWeldExclusions()
+{
+  if (!this->mjModelObj)
+    return;
+
+  this->dynamicWeldClusterMap =
+      ComputeWeldExclusions(this->mjModelObj, this->mjDataObj);
+}
+
+}  // namespace mujoco
+}  // namespace physics
+}  // namespace gz

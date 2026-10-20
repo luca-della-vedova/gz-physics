@@ -36,6 +36,12 @@ endif()
 message(STATUS "\n\n-- ====== Finding Dependencies ======")
 
 #--------------------------------------
+# TODO(azeey) Remove this and depend on a system package before release
+if(NOT SKIP_mujoco)
+  add_subdirectory(third_party/mujoco_vendor)
+endif()
+
+#--------------------------------------
 # Find gz-common
 gz_find_package(gz-common VERSION 7
   COMPONENTS geospatial graphics profiler
@@ -87,6 +93,13 @@ gz_find_package(GzBullet
   PKGCONFIG bullet
   PKGCONFIG_VER_COMPARISON >=)
 
+#--------------------------------------
+# Find mujoco for the mujoco plugin wrapper
+# gz_find_package(mujoco
+#   REQUIRED_BY mujoco
+#   PKGCONFIG_IGNORE # TODO(azeey) Revisit this
+#   CONFIG)
+
 message(STATUS "-------------------------------------------\n")
 
 # Plugin install dirs
@@ -104,7 +117,7 @@ set(GZ_MSVC_WPO OFF CACHE BOOL "Disable WPO")
 # Configure the build
 #============================================================================
 gz_configure_build(QUIT_IF_BUILD_ERRORS
-  COMPONENTS sdf heightmap mesh dartsim tpe bullet bullet-featherstone)
+  COMPONENTS sdf heightmap mesh dartsim tpe bullet bullet-featherstone mujoco)
 
 
 #============================================================================

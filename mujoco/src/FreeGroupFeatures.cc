@@ -1,0 +1,201 @@
+/*
+ * Copyright (C) 2025 Open Source Robotics Foundation
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ */
+
+#include "FreeGroupFeatures.hh"
+
+#include <mujoco/mujoco.h>
+
+#include <gz/physics/FreeGroup.hh>
+
+#include "Base.hh"
+namespace gz
+{
+namespace physics
+{
+namespace mujoco
+{
+/////////////////////////////////////////////////
+Identity FreeGroupFeatures::FindFreeGroupForModel(
+    const Identity &_modelID) const
+{
+  // TODO(azeey): Implement checks to see if this model has a freegroup.
+
+  return _modelID;
+}
+
+/////////////////////////////////////////////////
+Identity FreeGroupFeatures::FindFreeGroupForLink(
+    const Identity &_linkID) const
+{
+  // TODO(azeey) This assumes the freegroup encompasses the entire model. Handle
+  // the case where there could be multiple free groups within a model
+  const auto *linkInfo = this->ReferenceInterface<LinkInfo>(_linkID);
+  auto modelInfo = linkInfo->modelInfo.lock();
+  if (!modelInfo)
+  {
+    return this->GenerateInvalidId();
+  }
+
+  return this->GenerateIdentity(modelInfo->entityId, modelInfo);
+}
+
+/////////////////////////////////////////////////
+Identity FreeGroupFeatures::GetFreeGroupRootLink(const Identity &_groupID) const
+{
+  // TODO(azeey) This assumes the freegroup encompasses the entire model. Handle
+  // the case where there could be multiple free groups within a model
+  const auto *modelInfo = this->ReferenceInterface<ModelInfo>(_groupID);
+  auto linkInfo = modelInfo->links.at(modelInfo->body);
+  if (!linkInfo)
+  {
+    return this->GenerateInvalidId();
+  }
+  return this->GenerateIdentity(linkInfo->entityId, linkInfo);
+}
+
+/////////////////////////////////////////////////
+void FreeGroupFeatures::SetFreeGroupWorldAngularVelocity(
+    const Identity &_groupID, const AngularVelocity &_angularVelocity)
+{
+  // TODO(azeey) This assumes the freegroup encompasses the entire model. Handle
+  // the case where there could be multiple free groups within a model
+  const auto *modelInfo = this->ReferenceInterface<ModelInfo>(_groupID);
+  auto worldInfo = modelInfo->worldInfo;
+  this->RecompileSpec(*worldInfo);
+  auto *d = worldInfo->mjDataObj;
+  auto *m = worldInfo->mjModelObj;
+  const auto bodyId = mjs_getId(modelInfo->body->element);
+  const auto jntadr = m->body_jntadr[bodyId];
+  if (jntadr < 0)
+    return;
+  const auto qveladr = m->jnt_dofadr[jntadr];
+  mju_copy3(&d->qvel[qveladr] + 3, _angularVelocity.data());
+  // Only qvel changed, so just cvel needs to be refreshed.
+  mj_comVel(m, d);
+}
+
+/////////////////////////////////////////////////
+void FreeGroupFeatures::SetFreeGroupWorldLinearVelocity(
+    const Identity &_groupID, const LinearVelocity &_linearVelocity)
+{
+  // TODO(azeey) This assumes the freegroup encompasses the entire model. Handle
+  // the case where there could be multiple free groups within a model
+  const auto *modelInfo = this->ReferenceInterface<ModelInfo>(_groupID);
+  auto worldInfo = modelInfo->worldInfo;
+  this->RecompileSpec(*worldInfo);
+  auto *d = worldInfo->mjDataObj;
+  auto *m = worldInfo->mjModelObj;
+  const auto bodyId = mjs_getId(modelInfo->body->element);
+  const auto jntadr = m->body_jntadr[bodyId];
+  if (jntadr < 0)
+    return;
+  const auto qveladr = m->jnt_dofadr[jntadr];
+  mju_copy3(&d->qvel[qveladr], _linearVelocity.data());
+  // Only qvel changed, so just cvel needs to be refreshed.
+  mj_comVel(m, d);
+}
+
+/////////////////////////////////////////////////
+void FreeGroupFeatures::SetFreeGroupWorldPose(
+    const Identity &_groupID,
+    const PoseType &_pose)
+{
+  // TODO(azeey) This assumes the freegroup encompasses the entire model. Handle
+  // the case where there could be multiple free groups within a model
+  const auto *modelInfo = this->ReferenceInterface<ModelInfo>(_groupID);
+  auto worldInfo = modelInfo->worldInfo;
+  this->RecompileSpec(*worldInfo);
+  auto *d = worldInfo->mjDataObj;
+  auto *m = worldInfo->mjModelObj;
+  if (!d || !m)
+    return;
+
+  const auto bodyId = mjs_getId(modelInfo->body->element);
+  const auto jntadr = m->body_jntadr[bodyId];
+  const Eigen::Quaterniond quat(_pose.rotation());
+  const double quatCoeffs[] = {quat.w(), quat.x(), quat.y(), quat.z()};
+
+  // Bodies in static models have no joints, so their jntadr will be -1. Instead
+  // of modifying a 6DOF joint, we'll set the body's pose directly.
+  if (jntadr < 0)
+  {
+    if (!modelInfo->joints.idToObject.empty())
+      return;
+
+    mju_copy3(&m->body_pos[3 * bodyId], _pose.translation().data());
+    mju_copy4(&m->body_quat[4 * bodyId], quatCoeffs);
+    if (modelInfo->body)
+    {
+      // Also update the spec so we don't lose the new pose after a recompile.
+      mju_copy3(modelInfo->body->pos, _pose.translation().data());
+      mju_copy4(modelInfo->body->quat, quatCoeffs);
+    }
+  }
+  else
+  {
+    const auto qposadr = m->jnt_qposadr[jntadr];
+    const Eigen::Isometry3d oldRootPose =
+        convertPose(&d->qpos[qposadr], &d->qpos[qposadr + 3]);
+    const Eigen::Isometry3d deltaPose = _pose * oldRootPose.inverse();
+
+    int clusterId = -1;
+    if (!worldInfo->dynamicWeldClusterMap.empty())
+    {
+      clusterId = worldInfo->dynamicWeldClusterMap[m->body_weldid[bodyId]];
+    }
+
+    if (clusterId != -1)
+    {
+      for (int b = 1; b < m->nbody; ++b)
+      {
+        if (worldInfo->dynamicWeldClusterMap[m->body_weldid[b]] == clusterId)
+        {
+          int bJntadr = m->body_jntadr[b];
+          if (bJntadr >= 0 && m->jnt_type[bJntadr] == mjJNT_FREE)
+          {
+            int bQposadr = m->jnt_qposadr[bJntadr];
+            const Eigen::Isometry3d bOldPose =
+                convertPose(&d->qpos[bQposadr], &d->qpos[bQposadr + 3]);
+            const Eigen::Isometry3d bNewPose = deltaPose * bOldPose;
+
+            const Eigen::Vector3d bPos = bNewPose.translation();
+            const Eigen::Quaterniond bQuat(bNewPose.rotation());
+            const double bQuatCoeffs[] = {
+                bQuat.w(), bQuat.x(), bQuat.y(), bQuat.z()};
+
+            mju_copy3(&d->qpos[bQposadr], bPos.data());
+            mju_copy4(&d->qpos[bQposadr + 3], bQuatCoeffs);
+          }
+        }
+      }
+    }
+    else
+    {
+      mju_copy3(&d->qpos[qposadr], _pose.translation().data());
+      mju_copy4(&d->qpos[qposadr] + 3, quatCoeffs);
+    }
+  }
+  // Only refresh the kinematics that queries read (see WorldForwardStep).
+  // mj_comPos is needed by mj_comVel since cdof depends on the pose. The rest
+  // of mj_forward is recomputed by the next mj_step.
+  mj_kinematics(m, d);
+  mj_comPos(m, d);
+  mj_comVel(m, d);
+}
+}  // namespace mujoco
+}  // namespace physics
+}  // namespace gz

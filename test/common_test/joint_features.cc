@@ -146,6 +146,13 @@ TYPED_TEST(JointFeaturesTest, JointSetCommand)
 
     // Expect negative joint velocity after 1 step without joint command
     world->Step(output, state, input);
+    if (this->PhysicsEngineName(name) == "mujoco")
+    {
+      // An extra step is necessary for MuJoCo to stabilize the initial
+      // contact constraints between the base link and the ground plane
+      // before gravity correctly accelerates the pendulum.
+      world->Step(output, state, input);
+    }
     EXPECT_LT(joint->GetVelocity(0), 0.0);
 
     auto base_link = model->GetLink("base");
@@ -176,7 +183,15 @@ TYPED_TEST(JointFeaturesTest, JointSetCommand)
       // Call SetVelocityCommand before each step
       joint->SetVelocityCommand(0, 1);
       world->Step(output, state, input);
-      EXPECT_NEAR(1.0, joint->GetVelocity(0), 1e-2);
+      if (this->PhysicsEngineName(name) == "mujoco" && i < 1)
+      {
+        // MuJoCo needs some time to reach the commanded velocity
+        EXPECT_NEAR(1.0, joint->GetVelocity(0), 1e-1);
+      }
+      else
+      {
+        EXPECT_NEAR(1.0, joint->GetVelocity(0), 1e-2);
+      }
     }
 
     for (std::size_t i = 0; i < numSteps; ++i)
@@ -193,6 +208,23 @@ TYPED_TEST(JointFeaturesTest, JointSetCommand)
     {
       world->Step(output, state, input);
       EXPECT_LT(0.0, std::fabs(joint->GetVelocity(0)));
+    }
+
+    if (this->PhysicsEngineName(name) == "mujoco")
+    {
+      // Due to the way SetVelocityCommand is implemented in MuJoCo, a step
+      // command such as the one given above (0 -> 1) causes a large force to
+      // be applied on the joint by the internal velocity servo. Unlike the
+      // velocity constraint based method used in DART and bullet-featherstone,
+      // this does not take into account the dynamics of the lower link
+      // connected to a passive revolute joint. The large force causes a large
+      // angular velocity on the lower link which acts like a whipping action
+      // that moves the entire pendulum. Therefore, we have to wait for a few
+      // iterations for the base link to settle back to the ground.
+      for (std::size_t i = 0; i < 1000; ++i)
+      {
+        world->Step(output, state, input);
+      }
     }
 
     // Check that invalid velocity commands don't cause collisions to fail
@@ -1429,16 +1461,11 @@ struct JointFeatureAttachDetachList : gz::physics::FeatureList<
     gz::physics::AttachFixedJointFeature,
     gz::physics::DetachJointFeature,
     gz::physics::ForwardStep,
-    gz::physics::GetBasicJointProperties,
-    gz::physics::GetBasicJointState,
     gz::physics::GetEngineInfo,
-    gz::physics::GetJointFromModel,
     gz::physics::GetLinkFromModel,
     gz::physics::GetModelFromWorld,
     gz::physics::LinkFrameSemantics,
-    gz::physics::SetBasicJointState,
     gz::physics::SetJointTransformFromParentFeature,
-    gz::physics::SetJointVelocityCommandFeature,
     gz::physics::sdf::ConstructSdfModel,
     gz::physics::sdf::ConstructSdfWorld
 > { };
@@ -1578,6 +1605,197 @@ TYPED_TEST(JointFeaturesAttachDetachTest, JointAttachDetach)
     }
     frameDataModel2Body = model2Body->FrameDataRelativeToWorld();
     EXPECT_NEAR(0.0, frameDataModel2Body.linearVelocity.z(), 1e-3);
+  }
+}
+
+using JointFeatureAttachDetachContactList = gz::physics::FeatureList<
+    gz::physics::AttachFixedJointFeature,
+    gz::physics::DetachJointFeature,
+    gz::physics::FindFreeGroupFeature,
+    gz::physics::ForwardStep,
+    gz::physics::GetContactsFromLastStepFeature,
+    gz::physics::GetEngineInfo,
+    gz::physics::GetJointFromModel,
+    gz::physics::GetLinkFromModel,
+    gz::physics::GetModelFromWorld,
+    gz::physics::LinkFrameSemantics,
+    gz::physics::SetBasicJointState,
+    gz::physics::SetFreeGroupWorldPose,
+    gz::physics::SetJointTransformFromParentFeature,
+    gz::physics::sdf::ConstructSdfWorld
+>;
+
+template <class T>
+class JointFeaturesAttachDetachContactTest :
+  public JointFeaturesTest<T>{};
+using JointFeaturesAttachDetachContactTestTypes =
+  ::testing::Types<JointFeatureAttachDetachContactList>;
+TYPED_TEST_SUITE(JointFeaturesAttachDetachContactTest,
+                 JointFeaturesAttachDetachContactTestTypes);
+
+/////////////////////////////////////////////////
+// Verify contact generation and exclusion behavior during attach and detach operations.
+TYPED_TEST(JointFeaturesAttachDetachContactTest, JointAttachDetachContact)
+{
+  for (const std::string &name : this->pluginNames)
+  {
+    CHECK_UNSUPPORTED_ENGINE(name, "bullet-featherstone")
+
+    std::cout << "Testing plugin: " << name << std::endl;
+    gz::plugin::PluginPtr plugin = this->loader.Instantiate(name);
+
+    auto engine =
+        gz::physics::RequestEngine3d<JointFeatureAttachDetachContactList>::From(
+            plugin);
+    ASSERT_NE(nullptr, engine);
+
+    sdf::Root root;
+    const sdf::Errors errors = root.Load(common_test::worlds::kDetachableJointContactSdf);
+    ASSERT_TRUE(errors.empty()) << errors.front();
+
+    auto world = engine->ConstructWorld(*root.WorldByIndex(0));
+    ASSERT_NE(nullptr, world);
+
+    auto model1 = world->GetModel("M1");
+    auto model2 = world->GetModel("M2");
+    ASSERT_NE(nullptr, model1);
+    ASSERT_NE(nullptr, model2);
+
+    auto link1Base = model1->GetLink("link1_base");
+    auto link2Base = model2->GetLink("link2_base");
+    auto link2Moving = model2->GetLink("link2_moving");
+    ASSERT_NE(nullptr, link1Base);
+    ASSERT_NE(nullptr, link2Base);
+    ASSERT_NE(nullptr, link2Moving);
+
+    auto j2Prism = model2->GetJoint("j2_prism");
+    ASSERT_NE(nullptr, j2Prism);
+
+    gz::physics::ForwardStep::Output output;
+    gz::physics::ForwardStep::State state;
+    gz::physics::ForwardStep::Input input;
+
+    // 1. Initial step without attached joint: link1_base and link2_base
+    // touch/overlap, generating contacts
+    world->Step(output, state, input);
+    auto initialContacts = world->GetContactsFromLastStep();
+    EXPECT_GT(initialContacts.size(), 0u);
+
+    // 2. Attach fixed joint between link1_base and link2_base
+    auto fixedJoint = link2Base->AttachFixedJoint(link1Base);
+    ASSERT_NE(nullptr, fixedJoint);
+
+    // Set the transform from the parent (link1Base) to the joint (which is at link2Base origin)
+    // link1_base is at (0, 0, 0.5) and link2_base is at (0.8, 0, 0.5) in world frame.
+    Eigen::Isometry3d parentToJoint = Eigen::Isometry3d::Identity();
+    parentToJoint.translation() = Eigen::Vector3d(0.8, 0.0, 0.0);
+    fixedJoint->SetTransformFromParent(parentToJoint);
+
+    world->Step(output, state, input);
+    auto weldedContacts = world->GetContactsFromLastStep();
+    // Motionless welded bodies produce ZERO contacts between each other
+    EXPECT_EQ(0u, weldedContacts.size());
+
+    // 3. Move prismatic moving link from M2 (link2_moving) down to collide with
+    // revolute link from M1 (link1_moving)
+    j2Prism->SetPosition(0, -0.7);
+
+    world->Step(output, state, input);
+    auto movingContacts = world->GetContactsFromLastStep();
+    // Moving links with DOFs DO generate contact points when touching
+    // cross-model links
+    EXPECT_GT(movingContacts.size(), 0u);
+
+    // Reset link2_moving position
+    j2Prism->SetPosition(0, 0.0);
+    world->Step(output, state, input);
+
+    // 4. Detach fixed joint
+    fixedJoint->Detach();
+
+    world->Step(output, state, input);
+    auto detachedContacts = world->GetContactsFromLastStep();
+    // Contact points are generated again between the previously welded bodies
+    EXPECT_GT(detachedContacts.size(), 0u);
+  }
+}
+
+/////////////////////////////////////////////////
+// Verify contact generation and exclusion when SetWorldPose is called on a
+// free group immediately after AttachFixedJoint, before world->Step().
+TYPED_TEST(JointFeaturesAttachDetachContactTest, JointAttachFixedGroupMoveContact)
+{
+  for (const std::string &name : this->pluginNames)
+  {
+    CHECK_UNSUPPORTED_ENGINE(name, "bullet-featherstone")
+
+    std::cout << "Testing plugin: " << name << std::endl;
+    gz::plugin::PluginPtr plugin = this->loader.Instantiate(name);
+
+    auto engine =
+        gz::physics::RequestEngine3d<JointFeatureAttachDetachContactList>::From(
+            plugin);
+    ASSERT_NE(nullptr, engine);
+
+    sdf::Root root;
+    const sdf::Errors errors =
+        root.Load(common_test::worlds::kDetachableJointContactSdf);
+    ASSERT_TRUE(errors.empty()) << errors.front();
+
+    auto world = engine->ConstructWorld(*root.WorldByIndex(0));
+    ASSERT_NE(nullptr, world);
+
+    auto model1 = world->GetModel("M1");
+    auto model2 = world->GetModel("M2");
+    ASSERT_NE(nullptr, model1);
+    ASSERT_NE(nullptr, model2);
+
+    auto link1Base = model1->GetLink("link1_base");
+    auto link2Base = model2->GetLink("link2_base");
+    auto link2Moving = model2->GetLink("link2_moving");
+    ASSERT_NE(nullptr, link1Base);
+    ASSERT_NE(nullptr, link2Base);
+    ASSERT_NE(nullptr, link2Moving);
+
+    auto j2Prism = model2->GetJoint("j2_prism");
+    ASSERT_NE(nullptr, j2Prism);
+
+    gz::physics::ForwardStep::Output output;
+    gz::physics::ForwardStep::State state;
+    gz::physics::ForwardStep::Input input;
+
+    // 1. Initial step without attached joint: link1_base and link2_base touch
+    world->Step(output, state, input);
+    auto initialContacts = world->GetContactsFromLastStep();
+    EXPECT_GT(initialContacts.size(), 0u);
+
+    // 2. Attach fixed joint between link1_base and link2_base
+    auto fixedJoint = link2Base->AttachFixedJoint(link1Base);
+    ASSERT_NE(nullptr, fixedJoint);
+
+    Eigen::Isometry3d parentToJoint = Eigen::Isometry3d::Identity();
+    parentToJoint.translation() = Eigen::Vector3d(0.8, 0.0, 0.0);
+    fixedJoint->SetTransformFromParent(parentToJoint);
+
+    // 3. Move model1 immediately using free group BEFORE world->Step()
+    auto freeGroupM1 = model1->FindFreeGroup();
+    ASSERT_NE(nullptr, freeGroupM1);
+    gz::math::Pose3d movePose(0.1, 0, 0.5, 0, 0, 0);
+    freeGroupM1->SetWorldPose(gz::math::eigen3::convert(movePose));
+
+    // Step world and verify contact behavior
+    world->Step(output, state, input);
+    auto weldedContacts = world->GetContactsFromLastStep();
+    // Attached links must not generate contacts with each other
+    EXPECT_EQ(0u, weldedContacts.size());
+
+    // 4. Move prismatic moving link to collide with cross-model link
+    j2Prism->SetPosition(0, -0.7);
+
+    world->Step(output, state, input);
+    auto movingContacts = world->GetContactsFromLastStep();
+    // Contacts ARE generated when non-welded links touch
+    EXPECT_GT(movingContacts.size(), 0u);
   }
 }
 
@@ -2447,7 +2665,6 @@ using FixedJointFreeGroupFeatureList = gz::physics::FeatureList<
     gz::physics::LinkFrameSemantics,
     gz::physics::SetBasicJointState,
     gz::physics::SetJointTransformFromParentFeature,
-    gz::physics::SetJointVelocityCommandFeature,
     gz::physics::sdf::ConstructSdfModel,
     gz::physics::sdf::ConstructSdfWorld
 >;
@@ -2535,6 +2752,14 @@ TEST_F(FixedJointFreeGroupFeatureTestTypes, FixedJointFreeGroupMove)
     // Move parent model using free group
     freeGroupM1->SetWorldPose(gz::math::eigen3::convert(newModel1Pose));
 
+    // Verify immediate pose update for attached links before world->Step()
+    frameDataModel1Body = model1Body->FrameDataRelativeToWorld();
+    frameDataModel2Body = model2Body->FrameDataRelativeToWorld();
+    EXPECT_EQ(newModel1Pose,
+              gz::math::eigen3::convert(frameDataModel1Body.pose));
+    EXPECT_EQ(newModel2Pose,
+              gz::math::eigen3::convert(frameDataModel2Body.pose));
+
     for (std::size_t i = 0; i < numSteps; ++i)
     {
       world->Step(output, state, input);
@@ -2566,7 +2791,6 @@ using FixedJointWeldFeatureList = gz::physics::FeatureList<
     gz::physics::SetBasicJointState,
     gz::physics::SetFixedJointWeldChildToParentFeature,
     gz::physics::SetJointTransformFromParentFeature,
-    gz::physics::SetJointVelocityCommandFeature,
     gz::physics::sdf::ConstructSdfModel,
     gz::physics::sdf::ConstructSdfWorld
 >;
@@ -2697,6 +2921,408 @@ TEST_F(FixedJointWeldFeatureTestTypes, FixedJointWeldFall)
     }
     // Verify that the error is smaller when child is welded to parent
     EXPECT_LT(errWeld, errNoWeld);
+  }
+}
+
+struct JointFeatureScrewList : gz::physics::FeatureList<
+    gz::physics::ForwardStep,
+    gz::physics::GetBasicJointProperties,
+    gz::physics::GetBasicJointState,
+    gz::physics::GetEngineInfo,
+    gz::physics::GetJointFromModel,
+    gz::physics::GetLinkFromModel,
+    gz::physics::GetModelFromWorld,
+    gz::physics::LinkFrameSemantics,
+    gz::physics::SetBasicJointState,
+    gz::physics::Gravity,
+    gz::physics::sdf::ConstructSdfWorld
+> { };
+
+template <class T>
+class JointFeaturesScrewTest :
+  public JointFeaturesTest<T>{};
+using JointFeaturesScrewTestTypes =
+  ::testing::Types<JointFeatureScrewList>;
+TYPED_TEST_SUITE(JointFeaturesScrewTest,
+                 JointFeaturesScrewTestTypes);
+
+TYPED_TEST(JointFeaturesScrewTest, ScrewJointCouplingAndDamping)
+{
+  for (const std::string &name : this->pluginNames)
+  {
+    CHECK_SUPPORTED_ENGINE(name, "dartsim", "mujoco")
+
+    std::cout << "Testing plugin: " << name << std::endl;
+    gz::plugin::PluginPtr plugin = this->loader.Instantiate(name);
+
+    auto engine =
+        gz::physics::RequestEngine3d<JointFeatureScrewList>::From(plugin);
+    ASSERT_NE(nullptr, engine);
+
+    std::string worldStr = R"(
+    <sdf version="1.9">
+      <world name="screw_world">
+        <model name="screw_joint_test">
+          <link name="link0"/>
+          <link name="link1">
+            <inertial>
+              <mass>1.0</mass>
+              <inertia>
+                <ixx>0.01</ixx>
+                <iyy>0.01</iyy>
+                <izz>0.01</izz>
+              </inertia>
+            </inertial>
+          </link>
+          <joint name="j0" type="screw">
+            <parent>link0</parent>
+            <child>link1</child>
+            <screw_thread_pitch>2</screw_thread_pitch>
+          </joint>
+          <joint name="world_joint" type="fixed">
+            <parent>world</parent>
+            <child>link0</child>
+          </joint>
+        </model>
+        <model name="screw_joint_with_damping_test">
+          <link name="link0"/>
+          <link name="link1">
+            <inertial>
+              <mass>1.0</mass>
+              <inertia>
+                <ixx>0.01</ixx>
+                <iyy>0.01</iyy>
+                <izz>0.01</izz>
+              </inertia>
+            </inertial>
+          </link>
+          <joint name="j0" type="screw">
+            <parent>link0</parent>
+            <child>link1</child>
+            <screw_thread_pitch>2</screw_thread_pitch>
+            <axis>
+              <dynamics>
+                <damping>50.0</damping>
+              </dynamics>
+            </axis>
+          </joint>
+          <joint name="world_joint" type="fixed">
+            <parent>world</parent>
+            <child>link0</child>
+          </joint>
+        </model>
+      </world>
+    </sdf>)";
+
+    sdf::Root root;
+    const sdf::Errors errors = root.LoadSdfString(worldStr);
+    ASSERT_TRUE(errors.empty()) << errors.front();
+
+    auto world = engine->ConstructWorld(*root.WorldByIndex(0));
+
+    // --------------------------------------------------
+    // 1. Undamped Fall (Baseline & Coupling check)
+    // --------------------------------------------------
+    auto modelBaseline = world->GetModel("screw_joint_test");
+    auto jointBaseline = modelBaseline->GetJoint("j0");
+    auto parentLinkBaseline = modelBaseline->GetLink("link0");
+    auto childLinkBaseline = modelBaseline->GetLink("link1");
+
+    gz::physics::ForwardStep::Output output;
+    gz::physics::ForwardStep::State state;
+    gz::physics::ForwardStep::Input input;
+
+    // Ensure that the screw joint has 1 DOF since some engines might use two
+    // coupled joints to implement this.
+    EXPECT_EQ(1u, jointBaseline->GetDegreesOfFreedom());
+
+    // Ensure joint starts at 0
+    jointBaseline->SetPosition(0, 0.0);
+    jointBaseline->SetVelocity(0, 0.0);
+
+    // Sync initial frame poses
+    world->Step(output, state, input);
+    EXPECT_NEAR(0.0, jointBaseline->GetPosition(0), 1e-3);
+
+    // Step the simulation forward under natural gravity
+    const std::size_t numSteps = 100;
+    for (std::size_t i = 0; i < numSteps; ++i)
+    {
+      world->Step(output, state, input);
+    }
+
+    // Read the resulting linear position and velocity from joint API
+    double linPosBaseline = jointBaseline->GetPosition(0);
+    double linVelBaseline = jointBaseline->GetVelocity(0);
+
+    // Verify that the joint has moved dynamically under gravity
+    EXPECT_GT(std::abs(linPosBaseline), 1e-3);
+    EXPECT_GT(std::abs(linVelBaseline), 1e-2);
+
+    // Read parent and child global poses
+    auto parentFrameBaseline = parentLinkBaseline->FrameDataRelativeToWorld();
+    auto childFrameBaseline = childLinkBaseline->FrameDataRelativeToWorld();
+
+    gz::math::Pose3d parentPoseBaseline =
+        gz::math::eigen3::convert(parentFrameBaseline.pose);
+    gz::math::Pose3d childPoseBaseline =
+        gz::math::eigen3::convert(childFrameBaseline.pose);
+
+    // Compute child pose relative to parent
+    gz::math::Pose3d relativePoseBaseline =
+        parentPoseBaseline.Inverse() * childPoseBaseline;
+
+    const double positionTolerance = 5e-3;
+    const double pitch = 2.0 / (2.0 * GZ_PI);  // pitch = ScrewThreadPitch / 2pi
+
+    // Screw joint axis is Z-axis in SDFormat by default. Both DART and MuJoCo's
+    // primary coordinate represents rotation (radians) for screw joints.
+    // Verify that the primary joint position matches the relative angular Yaw
+    // rotation (radians)
+    EXPECT_NEAR(linPosBaseline, relativePoseBaseline.Rot().Yaw(),
+                positionTolerance);
+
+    // Verify that the relative Z translation matches the scaled primary
+    // coordinate (pitch * rotation)
+    EXPECT_NEAR(relativePoseBaseline.Pos().Z(), pitch * linPosBaseline,
+                positionTolerance);
+
+    // --------------------------------------------------
+    // 2. Damped Fall (Verify static SDF damping decay)
+    // --------------------------------------------------
+    auto modelDamped = world->GetModel("screw_joint_with_damping_test");
+    auto jointDamped = modelDamped->GetJoint("j0");
+
+    // Ensure joint starts at 0
+    jointDamped->SetPosition(0, 0.0);
+    jointDamped->SetVelocity(0, 0.0);
+
+    // Step the simulation forward for the exact same duration
+    for (std::size_t i = 0; i < numSteps; ++i)
+    {
+      world->Step(output, state, input);
+    }
+
+    double linPosDamped = jointDamped->GetPosition(0);
+    double linVelDamped = jointDamped->GetVelocity(0);
+
+    // Assert that the static SDF damping has opposed linear/angular velocity
+    // heavily, leading to much less linear travel and velocity compared to the
+    // baseline
+    EXPECT_LT(
+        std::abs(linPosDamped),
+        std::abs(linPosBaseline) * 0.3);  // Decayed position (3.3x smaller)
+    EXPECT_LT(std::abs(linVelDamped),
+              std::abs(linVelBaseline) * 0.2);  // Decayed velocity (5x smaller)
+  }
+}
+
+TYPED_TEST(JointFeaturesScrewTest, ScrewJointLimits)
+{
+  for (const std::string &name : this->pluginNames)
+  {
+    CHECK_SUPPORTED_ENGINE(name, "dartsim", "mujoco")
+
+    std::cout << "Testing plugin: " << name << std::endl;
+    gz::plugin::PluginPtr plugin = this->loader.Instantiate(name);
+
+    auto engine =
+        gz::physics::RequestEngine3d<JointFeatureScrewList>::From(plugin);
+    ASSERT_NE(nullptr, engine);
+
+    std::string worldStr = R"(
+    <sdf version="1.9">
+      <world name="screw_limits_world">
+        <gravity>0 0 0</gravity>
+        <model name="screw_model">
+          <link name="link0"/>
+          <link name="link1">
+            <inertial>
+              <mass>1.0</mass>
+              <inertia>
+                <ixx>0.01</ixx>
+                <iyy>0.01</iyy>
+                <izz>0.01</izz>
+              </inertia>
+            </inertial>
+          </link>
+          <joint name="j0" type="screw">
+            <parent>link0</parent>
+            <child>link1</child>
+            <screw_thread_pitch>0.2</screw_thread_pitch>
+            <axis>
+              <xyz>0 0 1</xyz>
+              <limit>
+                <lower>-10.0</lower>
+                <upper>10.0</upper>
+              </limit>
+            </axis>
+          </joint>
+          <joint name="world_joint" type="fixed">
+            <parent>world</parent>
+            <child>link0</child>
+          </joint>
+        </model>
+      </world>
+    </sdf>)";
+
+    sdf::Root root;
+    const sdf::Errors errors = root.LoadSdfString(worldStr);
+    ASSERT_TRUE(errors.empty()) << errors.front();
+
+    auto world = engine->ConstructWorld(*root.WorldByIndex(0));
+    ASSERT_NE(nullptr, world);
+
+    auto model = world->GetModel("screw_model");
+    ASSERT_NE(nullptr, model);
+    auto joint = model->GetJoint("j0");
+    auto parentLink = model->GetLink("link0");
+    auto childLink = model->GetLink("link1");
+    ASSERT_NE(nullptr, parentLink);
+    ASSERT_NE(nullptr, childLink);
+
+    gz::physics::ForwardStep::Output output;
+    gz::physics::ForwardStep::State state;
+    gz::physics::ForwardStep::Input input;
+
+    // Step once to initialize
+    world->Step(output, state, input);
+
+    auto getRelativeZ = [&]()
+    {
+      auto parentFrame = parentLink->FrameDataRelativeToWorld();
+      auto childFrame = childLink->FrameDataRelativeToWorld();
+      gz::math::Pose3d parentPose =
+          gz::math::eigen3::convert(parentFrame.pose);
+      gz::math::Pose3d childPose =
+          gz::math::eigen3::convert(childFrame.pose);
+      gz::math::Pose3d relativePose = parentPose.Inverse() * childPose;
+      return relativePose.Pos().Z();
+    };
+
+    const double limit = 10.0;
+
+    // Drive joint with a steady velocity until it reaches the upper limit
+    for (int i = 0; i < 1500; ++i)
+    {
+      if (joint->GetPosition(0) < limit * 0.99)
+        joint->SetForce(0, 2.0);
+      else
+        joint->SetForce(0, 0.0);
+      world->Step(output, state, input);
+    }
+
+    const double posUpper = getRelativeZ();
+    gzdbg << "[" << name << "] link relative Z posUpper after 1500 steps: " << posUpper << std::endl;
+
+    // Drive joint against the lower limit
+    for (int i = 0; i < 1500; ++i)
+    {
+      if (joint->GetPosition(0) > -limit * 0.99)
+        joint->SetForce(0, -2.0);
+      else
+        joint->SetForce(0, 0.0);
+      world->Step(output, state, input);
+    }
+
+    const double posLower = getRelativeZ();
+    gzdbg << "[" << name << "] link relative Z posLower after 1500 steps: " << posLower << std::endl;
+    const double pitch = 0.2 / (2.0 * GZ_PI);
+    EXPECT_NEAR(pitch * limit, posUpper, 5e-2);
+    EXPECT_NEAR(pitch * -limit, posLower, 5e-2);
+  }
+}
+
+struct JointTransformFromParentFeatureList : gz::physics::FeatureList<
+    gz::physics::ForwardStep,
+    gz::physics::GetEngineInfo,
+    gz::physics::GetWorldFromEngine,
+    gz::physics::GetModelFromWorld,
+    gz::physics::GetLinkFromModel,
+    gz::physics::GetJointFromModel,
+    gz::physics::GetBasicJointProperties,
+    gz::physics::LinkFrameSemantics,
+    gz::physics::SetJointTransformFromParentFeature,
+    gz::physics::sdf::ConstructSdfWorld
+> { };
+
+template <class T>
+class JointTransformFromParentTest:
+  public JointFeaturesTest<T>{};
+
+using JointTransformFromParentTestTypes =
+  ::testing::Types<JointTransformFromParentFeatureList>;
+TYPED_TEST_SUITE(JointTransformFromParentTest,
+                 JointTransformFromParentTestTypes);
+
+TYPED_TEST(JointTransformFromParentTest, SetJointTransformFromParent)
+{
+  for (const std::string &name : this->pluginNames)
+  {
+    CHECK_UNSUPPORTED_ENGINE(name, "bullet-featherstone")
+
+    std::cout << "Testing plugin: " << name << std::endl;
+    gz::plugin::PluginPtr plugin = this->loader.Instantiate(name);
+
+    auto engine =
+        gz::physics::RequestEngine3d<JointTransformFromParentFeatureList>::From(
+            plugin);
+    ASSERT_NE(nullptr, engine);
+
+    sdf::Root root;
+    const sdf::Errors errors = root.Load(common_test::worlds::kTestWorld);
+    ASSERT_TRUE(errors.empty()) << errors.front();
+
+    auto world = engine->ConstructWorld(*root.WorldByIndex(0));
+    ASSERT_NE(nullptr, world);
+
+    auto model = world->GetModel("double_pendulum_with_base");
+    ASSERT_NE(nullptr, model);
+
+    auto joint = model->GetJoint("upper_joint");
+    ASSERT_NE(nullptr, joint);
+
+    const gz::math::Pose3d initialTransform =
+        gz::math::eigen3::convert(joint->GetTransformFromParent());
+    EXPECT_EQ(gz::math::Pose3d(0, 0, 2.1, -1.5708, 0, 0), initialTransform);
+
+    auto childLink = model->GetLink("upper_link");
+    ASSERT_NE(nullptr, childLink);
+
+    // Initial child pose
+    gz::physics::FrameData3d initialChildFrameData =
+      childLink->FrameDataRelativeToWorld();
+    gz::math::Pose3d initialChildPose =
+      gz::math::eigen3::convert(initialChildFrameData.pose);
+
+    const gz::math::Pose3d newTransform(0.2, -0.3, 1.4, 0.1, 0.2, 0.3);
+    joint->SetTransformFromParent(gz::math::eigen3::convert(newTransform));
+
+    const gz::math::Pose3d updatedTransform =
+        gz::math::eigen3::convert(joint->GetTransformFromParent());
+    EXPECT_EQ(newTransform, updatedTransform);
+
+    // This checks that the use of SetJointTransformFromParent keeps the
+    // child-to-joint transform fixed. This implies that the child's absolute
+    // pose is actually what's changed when using that API.
+
+    // Step the world so physics engines that use constraint solvers for joints
+    // (like mujoco) will resolve the constraint and teleport the child body.
+    // Because it's a dynamic constraint, we need enough steps for it to move.
+    gz::physics::ForwardStep::Output output;
+    gz::physics::ForwardStep::State state;
+    gz::physics::ForwardStep::Input input;
+    for (int i = 0; i < 1000; ++i)
+      world->Step(output, state, input);
+
+    // New child pose
+    gz::physics::FrameData3d newChildFrameData =
+      childLink->FrameDataRelativeToWorld();
+    gz::math::Pose3d newChildPose =
+      gz::math::eigen3::convert(newChildFrameData.pose);
+
+    // We expect the child pose to change if the child body is teleported.
+    EXPECT_NE(initialChildPose, newChildPose);
   }
 }
 

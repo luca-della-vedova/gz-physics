@@ -138,6 +138,7 @@ test_sources = glob(
         "//bullet:libgz-physics-bullet-plugin.so",
         "//bullet-featherstone:libgz-physics-bullet-featherstone-plugin.so",
         "//dartsim:libgz-physics-dartsim-plugin.so",
+        "//mujoco:libgz-physics-mujoco-plugin.so",
         "//tpe:libgz-physics-tpe-plugin.so",
     ],
     env = {

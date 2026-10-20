@@ -1,0 +1,184 @@
+load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
+load("@rules_gazebo//gazebo:headers.bzl", "gz_export_header")
+load("//bazel:gz_physics_plugin_libraries.bzl", "gz_physics_plugin_libraries")
+
+package(
+    default_applicable_licenses = ["//:license"],
+    features = [
+        "layering_check",
+        "parse_headers",
+    ],
+)
+
+gz_export_header(
+    name = "Export",
+    out = "include/gz/physics/mujoco-plugin/Export.hh",
+    export_base = "GZ_PHYSICS_MUJOCO_PLUGIN",
+    lib_name = "gz-physics-mujoco",
+)
+
+public_headers = [
+    "include/gz/physics/mujoco-plugin/Export.hh",
+]
+
+private_headers = glob(["src/*.hh"])
+
+sources = glob(
+    ["src/*.cc"],
+    exclude = [
+        "src/*_TEST.cc",
+        "src/plugin.cc",
+    ],
+)
+
+cc_library(
+    name = "mujoco",
+    srcs = sources + private_headers,
+    hdrs = public_headers,
+    includes = [
+        "include",
+        "src",
+    ],
+    visibility = ["//visibility:public"],
+    deps = [
+        "//:gz-physics",
+        "//:heightmap",
+        "//:mesh",
+        "//:sdf",
+        "@eigen",
+        "@gz-common//:gz-common",
+        "@gz-common//graphics:graphics",
+        "@gz-common//profiler:profiler",
+        "@gz-math//:gz-math",
+        "@gz-math//eigen3:eigen3",
+        "@mujoco",
+        "@sdformat",
+    ],
+)
+
+gz_physics_plugin_libraries(
+    srcs = ["src/plugin.cc"] + private_headers,
+    so_lib_name = "libgz-physics-mujoco-plugin.so",
+    static_lib_name = "libgz-physics-mujoco-plugin-static",
+    visibility = ["//visibility:public"],
+    deps = [
+        ":mujoco",
+        "//:gz-physics",
+        "//:heightmap",
+        "//:mesh",
+        "//:sdf",
+        "@eigen",
+        "@gz-common//:gz-common",
+        "@gz-common//graphics:graphics",
+        "@gz-common//profiler:profiler",
+        "@gz-math//:gz-math",
+        "@gz-math//eigen3:eigen3",
+        "@gz-plugin//:register",
+        "@mujoco",
+        "@sdformat",
+    ],
+)
+
+cc_test(
+    name = "mujoco_SDFFeatures_TEST",
+    srcs = [
+        "src/SDFFeatures_TEST.cc",
+        ":libgz-physics-mujoco-plugin.so",
+    ] + private_headers,
+    copts = ["-Imujoco/src"],
+    data = [
+        "//mujoco:libgz-physics-mujoco-plugin.so",
+        "//test:common_test_worlds",
+        "//test:resources",
+    ],
+    env = {
+        "GZ_BAZEL": "1",
+    },
+    deps = [
+        ":Export",
+        "//:gz-physics",
+        "//:heightmap",
+        "//:mesh",
+        "//:sdf",
+        "//test:test_headers",
+        "@eigen",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@gz-common//:gz-common",
+        "@gz-common//graphics:graphics",
+        "@gz-common//testing:testing",
+        "@gz-math//:gz-math",
+        "@gz-math//eigen3:eigen3",
+        "@gz-plugin//:core",
+        "@gz-plugin//:loader",
+        "@mujoco//:libmujoco_hdrs",
+        "@sdformat",
+    ],
+)
+
+cc_test(
+    name = "mujoco_WeldExclusions_TEST",
+    srcs = [
+        "src/WeldExclusions_TEST.cc",
+        ":libgz-physics-mujoco-plugin.so",
+    ] + private_headers,
+    copts = ["-Imujoco/src"],
+    data = [
+        "//mujoco:libgz-physics-mujoco-plugin.so",
+    ],
+    env = {
+        "GZ_BAZEL": "1",
+    },
+    deps = [
+        ":Export",
+        "//:gz-physics",
+        "//:sdf",
+        "//test:test_headers",
+        "@eigen",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@gz-math//:gz-math",
+        "@gz-math//eigen3:eigen3",
+        "@gz-plugin//:core",
+        "@gz-plugin//:loader",
+        "@mujoco//:libmujoco_hdrs",
+        "@sdformat",
+    ],
+)
+
+cc_test(
+    name = "mujoco_WorldFixedJointForce_TEST",
+    srcs = [
+        "src/WorldFixedJointForce_TEST.cc",
+    ],
+    data = [
+        "//mujoco:libgz-physics-mujoco-plugin.so",
+    ],
+    env = {
+        "GZ_BAZEL": "1",
+    },
+    deps = [
+        "//:gz-physics",
+        "//:sdf",
+        "//test:test_headers",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@gz-math//:gz-math",
+        "@gz-plugin//:core",
+        "@gz-plugin//:loader",
+        "@sdformat",
+    ],
+)
+
+cc_test(
+    name = "mujoco_WorldInfoDestructor_TEST",
+    srcs = [
+        "src/WorldInfoDestructor_TEST.cc",
+    ] + private_headers,
+    deps = [
+        ":mujoco",
+        "@googletest//:gtest",
+        "@googletest//:gtest_main",
+        "@mujoco",
+    ],
+)

@@ -33,6 +33,7 @@ const auto kCollisionPairContactPointSdf =
   CommonTestWorld("collision_pair_contact_point.sdf");
 const auto kContactSdf = CommonTestWorld("contact.sdf");
 const auto kDetachableJointWorld = CommonTestWorld("detachable_joint.world");
+const auto kDetachableJointContactSdf = CommonTestWorld("detachable_joint_contact.sdf");
 const auto kEmptySdf = CommonTestWorld("empty.sdf");
 const auto kFallingWorld = CommonTestWorld("falling.world");
 const auto kFallingAddedMassWorld = CommonTestWorld("falling_added_mass.world");
@@ -55,6 +56,7 @@ const auto kPoseOffsetSdf = CommonTestWorld("pose_offset.sdf");
 const auto kShapesCategoryBitmaskWorld = CommonTestWorld("shapes_category_bitmask.sdf");
 const auto kShapesBitmaskWorld = CommonTestWorld("shapes_bitmask.sdf");
 const auto kShapesWorld = CommonTestWorld("shapes.world");
+const auto kSinglePendulumWithBase = CommonTestWorld("single_pendulum_with_base.sdf");
 const auto kSlipComplianceSdf = CommonTestWorld("slip_compliance.sdf");
 const auto kSphereSdf = CommonTestWorld("sphere.sdf");
 const auto kSphereGravitySdf = CommonTestWorld("sphere_gravity.sdf");
@@ -68,6 +70,8 @@ const auto kWorldSingleNestedModelSdf =
   CommonTestWorld("world_single_nested_model.sdf");
 const auto kWorldWithNestedModelSdf =
   CommonTestWorld("world_with_nested_model.sdf");
+const auto kNestedModelSelfCollideSdf =
+  CommonTestWorld("nested_model_self_collide.sdf");
 const auto kMultipleObjectsComplexSdf =
   CommonTestWorld("multiple_objects_complex.sdf");
 }  // namespace common_test::worlds
